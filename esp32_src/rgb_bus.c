@@ -258,7 +258,7 @@
     }
 
 
-    STATIC mp_obj_t mp_lcd_rgb_bus_tx_color(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
+    static mp_obj_t mp_lcd_rgb_bus_tx_color(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
     {
         enum { ARG_self, ARG_cmd, ARG_data, ARG_x_start, ARG_y_start, ARG_x_end, ARG_y_end };
         static const mp_arg_t allowed_args[] = {
@@ -305,10 +305,10 @@
         return mp_const_none;
     }
 
-    STATIC MP_DEFINE_CONST_FUN_OBJ_KW(mp_lcd_rgb_bus_tx_color_obj, 7, mp_lcd_rgb_bus_tx_color);
+    static MP_DEFINE_CONST_FUN_OBJ_KW(mp_lcd_rgb_bus_tx_color_obj, 7, mp_lcd_rgb_bus_tx_color);
 
 
-    STATIC const mp_rom_map_elem_t mp_lcd_rgb_bus_locals_dict_table[] = {
+    static const mp_rom_map_elem_t mp_lcd_rgb_bus_locals_dict_table[] = {
         { MP_ROM_QSTR(MP_QSTR_get_lane_count),    MP_ROM_PTR(&mp_lcd_bus_get_lane_count_obj)    },
         { MP_ROM_QSTR(MP_QSTR_register_callback), MP_ROM_PTR(&mp_lcd_bus_register_callback_obj)     },
         { MP_ROM_QSTR(MP_QSTR_tx_color),          MP_ROM_PTR(&mp_lcd_rgb_bus_tx_color_obj)          },
@@ -317,7 +317,7 @@
         { MP_ROM_QSTR(MP_QSTR___del__),           MP_ROM_PTR(&mp_lcd_bus_deinit_obj)            }
     };
 
-    STATIC MP_DEFINE_CONST_DICT(mp_lcd_rgb_bus_locals_dict, mp_lcd_rgb_bus_locals_dict_table);
+    static MP_DEFINE_CONST_DICT(mp_lcd_rgb_bus_locals_dict, mp_lcd_rgb_bus_locals_dict_table);
 
     MP_DEFINE_CONST_OBJ_TYPE(
         mp_lcd_rgb_bus_type,

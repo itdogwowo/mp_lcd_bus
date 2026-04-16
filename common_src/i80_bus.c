@@ -84,7 +84,7 @@ void write_rgb565_swap16(mp_lcd_i80_bus_obj_t *self, void *color, size_t color_s
  * can be set since the code is going to run as fast as possible which is not
  * going to come close to what the maximum bitrate the display is able to use.
  */
-STATIC mp_obj_t mp_lcd_i80_bus_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args)
+static mp_obj_t mp_lcd_i80_bus_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args)
 {
     enum {
         ARG_dc,
