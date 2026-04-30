@@ -8,13 +8,10 @@ try:
 except ImportError:
     _HAS_HEAP_CAPS = False
 
-_COLORMOD_MAP = {
-    "RGB565": 0x55,
-    "RGB888": 0x77,
-}
-
 
 class LCDController:
+
+    _COLMOD_TABLE = {}
 
     def __init__(
         self,
@@ -29,9 +26,10 @@ class LCDController:
         color_space="RGB565",
         rgb565_byte_swap=False,
     ):
-        if color_space not in _COLORMOD_MAP:
+        colmod_table = type(self)._COLMOD_TABLE
+        if color_space not in colmod_table:
             raise ValueError(
-                f"color_space must be one of {tuple(_COLORMOD_MAP.keys())}"
+                f"color_space must be one of {tuple(colmod_table.keys())}"
             )
 
         self._bus = bus
@@ -41,8 +39,7 @@ class LCDController:
         self._color_order = color_order.upper()
         self._invert = bool(invert)
         self._color_space = color_space
-        self._colmod_val = _COLORMOD_MAP[color_space]
-        self._bytes_per_pixel = 2 if color_space == "RGB565" else 3
+        self._colmod_val, self._bytes_per_pixel = colmod_table[color_space]
         self._rgb565_byte_swap = rgb565_byte_swap
         self._initialized = False
 

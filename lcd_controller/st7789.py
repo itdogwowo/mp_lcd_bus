@@ -3,6 +3,11 @@ from ._base import LCDController
 
 class ST7789(LCDController):
 
+    _COLMOD_TABLE = {
+        "RGB565": (0x55, 2),
+        "RGB888": (0x77, 3),
+    }
+
     def _build_init_sequence(self):
         w = self._width - 1
         h = self._height - 1
