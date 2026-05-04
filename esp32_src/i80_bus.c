@@ -18,6 +18,10 @@
     #include "esp_heap_caps.h"
     #include "hal/lcd_types.h"
 
+    #if !defined(SOC_LCD_I80_BUS_WIDTH) && defined(SOC_LCDCAM_I80_BUS_WIDTH)
+        #define SOC_LCD_I80_BUS_WIDTH SOC_LCDCAM_I80_BUS_WIDTH
+    #endif
+
     mp_lcd_err_t i80_del(lcd_panel_io_t *io);
     mp_lcd_err_t i80_init(lcd_panel_io_t *io, uint16_t width, uint16_t height, uint8_t bpp, uint32_t buffer_size);
     mp_lcd_err_t i80_get_lane_count(lcd_panel_io_t *io, uint8_t *lane_count);
