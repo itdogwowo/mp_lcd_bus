@@ -1,437 +1,328 @@
-
-// local includes
-#include "lcd_types.h"
-#include "modlcd_bus.h"
 #include "spi_bus.h"
 
-// esp-idf includes
-#include "driver/spi_common.h"
-#include "driver/spi_master.h"
-#include "soc/gpio_sig_map.h"
-#include "soc/spi_pins.h"
-#include "rom/gpio.h"
-#include "esp_lcd_panel_io.h"
+#include "py/runtime.h"
+#include "py/objarray.h"
+#include "py/mphal.h"
 #include "esp_heap_caps.h"
 
-// micropython includes
-#include "mphalport.h"
-#include "py/obj.h"
-#include "py/runtime.h"
-
-// stdlib includes
 #include <string.h>
 
+static uint32_t lane_flag(int n) {
+    switch (n) {
+        case 2:  return SPI_TRANS_MODE_DIO;
+        case 4:  return SPI_TRANS_MODE_QIO;
+        case 8:  return SPI_TRANS_MODE_OCT;
+        default: return 0;
+    }
+}
 
-mp_lcd_err_t spi_del(lcd_panel_io_t *io);
-mp_lcd_err_t spi_init(lcd_panel_io_t *io, uint16_t width, uint16_t height, uint8_t bpp, uint32_t buffer_size);
-mp_lcd_err_t spi_get_lane_count(lcd_panel_io_t *io, uint8_t *lane_count);
+static int enqueue(mp_lcd_spi_bus_obj_t *self, const mp_obj_t buf, void *rx) {
+    int idx = self->queue_tail;
+    mp_obj_array_t *a = (mp_obj_array_t *)buf;
+
+    memset(&self->trans[idx], 0, sizeof(spi_transaction_t));
+    self->trans[idx].length    = a->len * 8;
+    self->trans[idx].tx_buffer = a->items;
+    self->trans[idx].rx_buffer = rx;
+    self->trans[idx].flags     = lane_flag(self->lane_count);
+    self->trans[idx].user      = (void *)(uintptr_t)(idx + 1);
+
+    self->ref_bufs[idx] = buf;
+
+    if (spi_device_queue_trans(self->handle, &self->trans[idx], 0) != ESP_OK) {
+        self->ref_bufs[idx] = mp_const_none;
+        return -1;
+    }
+
+    self->queue_tail = (self->queue_tail + 1) % SPI_DMA_QUEUE_DEPTH;
+    self->queue_count++;
+    return idx + 1;
+}
 
 
-static mp_obj_t mp_lcd_spi_bus_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args)
-{
-     enum {
-        ARG_dc,
-        ARG_host,
-        ARG_sclk,
-        ARG_freq,
-        ARG_mosi,
-        ARG_miso,
-        ARG_cs,
-        ARG_wp,
-        ARG_hd,
-        ARG_quad_spi,
-        ARG_tx_only,
-        ARG_cmd_bits,
-        ARG_param_bits,
-        ARG_dc_low_on_data,
-        ARG_sio_mode,
-        ARG_lsb_first,
-        ARG_cs_high_active,
-        ARG_spi_mode
+static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
+    enum { ARG_data, ARG_clk, ARG_freq, ARG_host };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_data, MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_clk,  MP_ARG_INT | MP_ARG_REQUIRED },
+        { MP_QSTR_freq, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 40000000} },
+        { MP_QSTR_host, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = SPI2_HOST} },
     };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
-    /*
-     * The required parameters are required to keep the API consistant.
-     * This is done for portability reasons.
-     * You can set the required values in a manner that will ttrigger
-     * an automatic setup procedure
-     * host: -1 if mosi != -1 and sclk != -1
-     * mosi -1 & sclk -1: if host != -1
-     * freq: -1
-     */
+    size_t n;
+    mp_obj_t *items;
+    mp_obj_get_array(args[ARG_data].u_obj, &n, &items);
+    if (n < 1 || n > 8) {
+        mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("data pin count must be 1-8"));
+    }
 
-    const mp_arg_t make_new_args[] = {
-        { MP_QSTR_dc,               MP_ARG_OBJ  | MP_ARG_REQUIRED },
-        { MP_QSTR_host,             MP_ARG_INT  | MP_ARG_REQUIRED },
-        { MP_QSTR_sclk,             MP_ARG_INT  | MP_ARG_REQUIRED },
-        { MP_QSTR_freq,             MP_ARG_INT  | MP_ARG_REQUIRED },
-        { MP_QSTR_mosi,             MP_ARG_INT  | MP_ARG_REQUIRED },
-        { MP_QSTR_miso,             MP_ARG_INT  | MP_ARG_KW_ONLY, { .u_int = -1       } },
-        { MP_QSTR_cs,               MP_ARG_INT  | MP_ARG_KW_ONLY, { .u_int = -1       } },
-        { MP_QSTR_wp,               MP_ARG_INT  | MP_ARG_KW_ONLY, { .u_int = -1       } },
-        { MP_QSTR_hd,               MP_ARG_INT  | MP_ARG_KW_ONLY, { .u_int = -1       } },
-        { MP_QSTR_quad_spi,         MP_ARG_BOOL | MP_ARG_KW_ONLY, { .u_bool = false   } },
-        { MP_QSTR_tx_only,          MP_ARG_BOOL | MP_ARG_KW_ONLY, { .u_bool = false   } },
-        { MP_QSTR_cmd_bits,         MP_ARG_INT  | MP_ARG_KW_ONLY, { .u_int = 8        } },
-        { MP_QSTR_param_bits,       MP_ARG_INT  | MP_ARG_KW_ONLY, { .u_int = 8        } },
-        { MP_QSTR_dc_low_on_data,   MP_ARG_BOOL | MP_ARG_KW_ONLY, { .u_bool = false   } },
-        { MP_QSTR_sio_mode,         MP_ARG_BOOL | MP_ARG_KW_ONLY, { .u_bool = false   } },
-        { MP_QSTR_lsb_first,        MP_ARG_BOOL | MP_ARG_KW_ONLY, { .u_bool = false   } },
-        { MP_QSTR_cs_high_active,   MP_ARG_BOOL | MP_ARG_KW_ONLY, { .u_bool = false   } },
-        { MP_QSTR_spi_mode,         MP_ARG_INT  | MP_ARG_KW_ONLY, { .u_int = 0        } }
-    };
-
-    mp_arg_val_t args[MP_ARRAY_SIZE(make_new_args)];
-    mp_arg_parse_all_kw_array(
-        n_args,
-        n_kw,
-        all_args,
-        MP_ARRAY_SIZE(make_new_args),
-        make_new_args,
-        args
-    );
-
-    // create new object
     mp_lcd_spi_bus_obj_t *self = m_new_obj(mp_lcd_spi_bus_obj_t);
     self->base.type = &mp_lcd_spi_bus_type;
 
-    uint32_t flags = SPICOMMON_BUSFLAG_MASTER;
-    int dc = (int) args[ARG_dc].u_int;
-    int host = (int) args[ARG_host].u_int;
-    int mosi = (int) args[ARG_mosi].u_int;
-    int miso = (int) args[ARG_miso].u_int;
-    int sclk = (int) args[ARG_sclk].u_int;
-    int cs = (int) args[ARG_cs].u_int;
-    int freq = (int) args[ARG_freq].u_int;
-    int wp = (int) args[ARG_wp].u_int;
-    int hd = (int) args[ARG_hd].u_int;
+    self->lane_count = (int)n;
+    self->clk_pin = args[ARG_clk].u_int;
+    self->freq    = args[ARG_freq].u_int;
+    self->host    = args[ARG_host].u_int;
 
-    if ((args[ARG_spi_mode].u_int > 3) || (args[ARG_spi_mode].u_int < 0)) {
-        mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("invalid spi mode (%d)"), args[ARG_spi_mode].u_int);
+    for (int i = 0; i < 8; i++)
+        self->data_pins[i] = (i < (int)n) ? mp_obj_get_int(items[i]) : -1;
+
+    self->zero_buf = (uint8_t *)heap_caps_calloc(1, 32768, MALLOC_CAP_DMA);
+    if (!self->zero_buf) {
+        m_del_obj(mp_lcd_spi_bus_obj_t, self);
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DMA zero buffer alloc failed"));
     }
 
-    if ((mosi == -1) && (miso == -1) && (sclk == -1)) {
-        if (host == 0) {
-            #ifdef SPI_IOMUX_PIN_NUM_MISO
-                sclk = SPI_IOMUX_PIN_NUM_CLK;
-                mosi = SPI_IOMUX_PIN_NUM_MOSI;
+    spi_bus_config_t bcfg = {
+        .mosi_io_num   = self->data_pins[0],
+        .miso_io_num   = self->data_pins[1],
+        .sclk_io_num   = self->clk_pin,
+        .quadwp_io_num = self->data_pins[2],
+        .quadhd_io_num = self->data_pins[3],
+        .data4_io_num  = self->data_pins[4],
+        .data5_io_num  = self->data_pins[5],
+        .data6_io_num  = self->data_pins[6],
+        .data7_io_num  = self->data_pins[7],
+        .max_transfer_sz = 32768,
+        .flags          = SPICOMMON_BUSFLAG_MASTER,
+    };
 
-                if (!args[ARG_tx_only].u_bool) {
-                    miso = SPI_IOMUX_PIN_NUM_MISO;
-                }
-                if (cs == -1) {
-                    cs = SPI_IOMUX_PIN_NUM_CS;
-                }
-                if (args[ARG_quad_spi].u_bool) {
-                    if (wp == -1) {
-                        wp = SPI_IOMUX_PIN_NUM_WP;
-                    }
-                    if (hd == -1) {
-                        hd = SPI_IOMUX_PIN_NUM_HD;
-                    }
-                }
-            #else
-                mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("host 0 is not available for this board"));
-            #endif
-        } else if (host == 1) {
-            #ifdef SPI2_IOMUX_PIN_NUM_MISO
-                sclk = SPI2_IOMUX_PIN_NUM_CLK;
-                mosi = SPI2_IOMUX_PIN_NUM_MOSI;
+    uint32_t dflags = 0;
+    if (self->lane_count >= 2) dflags |= SPI_DEVICE_HALFDUPLEX;
 
-                if (!args[ARG_tx_only].u_bool) {
-                    miso = SPI2_IOMUX_PIN_NUM_MISO;
-                }
-                if (cs == -1) {
-                    cs = SPI2_IOMUX_PIN_NUM_CS;
-                }
-                if (args[ARG_quad_spi].u_bool) {
-                    if (wp == -1) {
-                        wp = SPI2_IOMUX_PIN_NUM_WP;
-                    }
-                    if (hd == -1) {
-                        hd = SPI2_IOMUX_PIN_NUM_HD;
-                    }
-                }
-            #else
-                mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("host 1 is not available for this board"));
-            #endif
+    spi_device_interface_config_t dcfg = {
+        .clock_speed_hz = (uint32_t)self->freq,
+        .mode = 0,
+        .spics_io_num = -1,
+        .queue_size = SPI_DMA_QUEUE_DEPTH,
+        .flags = dflags,
+    };
 
-        } else if (host == 2) {
-            #ifdef SPI3_IOMUX_PIN_NUM_MISO
-                sclk = SPI3_IOMUX_PIN_NUM_CLK;
-                mosi = SPI3_IOMUX_PIN_NUM_MOSI;
-
-                if (!args[ARG_tx_only].u_bool) {
-                    miso = SPI3_IOMUX_PIN_NUM_MISO;
-                }
-                if (cs == -1) {
-                    cs = SPI3_IOMUX_PIN_NUM_CS;
-                }
-                if (args[ARG_quad_spi].u_bool) {
-                    if (wp == -1) {
-                        wp = SPI3_IOMUX_PIN_NUM_WP;
-                    }
-                    if (hd == -1) {
-                        hd = SPI3_IOMUX_PIN_NUM_HD;
-                    }
-                }
-            #else
-                mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("host 2 is not available for this board"));
-            #endif
-        } else {
-            mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("invalid spi host (%d)"), host);
-        }
-    } else if (host == -1) {
-        #ifdef SPI_IOMUX_PIN_NUM_MISO
-            if (
-                (mosi == SPI_IOMUX_PIN_NUM_MOSI) &&
-                (sclk == SPI_IOMUX_PIN_NUM_CLK) &&
-                (((args[ARG_tx_only].u_bool) && (miso == -1)) || ((!args[ARG_tx_only].u_bool) && (miso == SPI_IOMUX_PIN_NUM_MISO))) &&
-                (
-                    ((args[ARG_quad_spi].u_bool) && (wp == SPI_IOMUX_PIN_NUM_WP) && (hd == SPI_IOMUX_PIN_NUM_HD)) ||
-                    ((!args[ARG_quad_spi].u_bool) && (wp == -1) && (hd == -1))
-                ) &&
-                ((cs == -1) || (cs == SPI_IOMUX_PIN_NUM_CS))
-            ) {
-                host = 0;
-            } else {
-                mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("unable to set host"));
-            }
-        #endif
-
-        #ifdef SPI2_IOMUX_PIN_NUM_MISO
-            if (
-                (mosi == SPI2_IOMUX_PIN_NUM_MOSI) &&
-                (sclk == SPI2_IOMUX_PIN_NUM_CLK) &&
-                (((args[ARG_tx_only].u_bool) && (miso == -1)) || ((!args[ARG_tx_only].u_bool) && (miso == SPI2_IOMUX_PIN_NUM_MISO))) &&
-                (
-                    ((args[ARG_quad_spi].u_bool) && (wp == SPI2_IOMUX_PIN_NUM_WP) && (hd == SPI2_IOMUX_PIN_NUM_HD)) ||
-                    ((!args[ARG_quad_spi].u_bool) && (wp == -1) && (hd == -1))
-                ) &&
-                ((cs == -1) || (cs == SPI2_IOMUX_PIN_NUM_CS))
-            ) {
-                host = 1;
-            } else {
-                mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("unable to set host"));
-            }
-        #endif
-
-        #ifdef SPI3_IOMUX_PIN_NUM_MISO
-            if (
-                (mosi == SPI3_IOMUX_PIN_NUM_MOSI) &&
-                (sclk == SPI3_IOMUX_PIN_NUM_CLK) &&
-                (((args[ARG_tx_only].u_bool) && (miso == -1)) || ((!args[ARG_tx_only].u_bool) && (miso == SPI3_IOMUX_PIN_NUM_MISO))) &&
-                (
-                    ((args[ARG_quad_spi].u_bool) && (wp == SPI3_IOMUX_PIN_NUM_WP) && (hd == SPI3_IOMUX_PIN_NUM_HD)) ||
-                    ((!args[ARG_quad_spi].u_bool) && (wp == -1) && (hd == -1))
-                ) &&
-                ((cs == -1) || (cs == SPI3_IOMUX_PIN_NUM_CS))
-            ) {
-                host = 2;
-            } else {
-                mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("unable to set host"));
-            }
-        #endif
-
+    if (spi_bus_initialize(self->host, &bcfg, SPI_DMA_CH_AUTO) != ESP_OK) {
+        heap_caps_free(self->zero_buf);
+        m_del_obj(mp_lcd_spi_bus_obj_t, self);
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("spi_bus_initialize"));
+    }
+    if (spi_bus_add_device(self->host, &dcfg, &self->handle) != ESP_OK) {
+        heap_caps_free(self->zero_buf);
+        spi_bus_free(self->host);
+        m_del_obj(mp_lcd_spi_bus_obj_t, self);
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("spi_bus_add_device"));
     }
 
-    if (!args[ARG_quad_spi].u_bool) {
-        wp = -1;
-        hd = -1;
-    } else {
-        flags |= SPICOMMON_BUSFLAG_QUAD;
-    }
-
-    if (args[ARG_tx_only].u_bool) {
-        miso = -1;
-    }
-
-    if (host == 0) {
-        #ifdef SPI_IOMUX_PIN_NUM_MISO
-            if (
-                (mosi == SPI_IOMUX_PIN_NUM_MOSI) &&
-                (sclk == SPI_IOMUX_PIN_NUM_CLK) &&
-                (((args[ARG_tx_only].u_bool) && (miso == -1)) || ((!args[ARG_tx_only].u_bool) && (miso == SPI_IOMUX_PIN_NUM_MISO))) &&
-                (
-                    ((args[ARG_quad_spi].u_bool) && (wp == SPI_IOMUX_PIN_NUM_WP) && (hd == SPI_IOMUX_PIN_NUM_HD)) ||
-                    ((!args[ARG_quad_spi].u_bool) && (wp == -1) && (hd == -1))
-                ) &&
-                ((cs == -1) || (cs == SPI_IOMUX_PIN_NUM_CS))
-            ) {
-                if (freq == -1) {
-                    freq = 80000000;
-                }
-                flags |= SPICOMMON_BUSFLAG_IOMUX_PINS;
-            } else {
-                if (freq == -1) {
-                    freq = 26600000;
-                }
-                flags |= SPICOMMON_BUSFLAG_GPIO_PINS;
-            }
-        #else
-            mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("spi host 0 is not supported by this board"));
-        #endif
-    } else if (host == 1) {
-        #ifdef SPI2_IOMUX_PIN_NUM_MISO
-            if (
-                (mosi == SPI2_IOMUX_PIN_NUM_MOSI) &&
-                (sclk == SPI2_IOMUX_PIN_NUM_CLK) &&
-                (((args[ARG_tx_only].u_bool) && (miso == -1)) || ((!args[ARG_tx_only].u_bool) && (miso == SPI2_IOMUX_PIN_NUM_MISO))) &&
-                (
-                    ((args[ARG_quad_spi].u_bool) && (wp == SPI2_IOMUX_PIN_NUM_WP) && (hd == SPI2_IOMUX_PIN_NUM_HD)) ||
-                    ((!args[ARG_quad_spi].u_bool) && (wp == -1) && (hd == -1))
-                ) &&
-                ((cs == -1) || (cs == SPI2_IOMUX_PIN_NUM_CS))
-            ) {
-                if (freq == -1) {
-                    freq = 80000000;
-                }
-                flags |= SPICOMMON_BUSFLAG_IOMUX_PINS;
-            } else {
-                if (freq == -1) {
-                    freq = 26600000;
-                }
-                flags |= SPICOMMON_BUSFLAG_GPIO_PINS;
-            }
-        #else
-            mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("spi host 1 is not supported by this board"));
-        #endif
-    } else if (host == 2) {
-        #ifdef SPI3_IOMUX_PIN_NUM_MISO
-            if (
-                (mosi == SPI3_IOMUX_PIN_NUM_MOSI) &&
-                (sclk == SPI3_IOMUX_PIN_NUM_CLK) &&
-                (((args[ARG_tx_only].u_bool) && (miso == -1)) || ((!args[ARG_tx_only].u_bool) && (miso == SPI3_IOMUX_PIN_NUM_MISO))) &&
-                (
-                    ((args[ARG_quad_spi].u_bool) && (wp == SPI3_IOMUX_PIN_NUM_WP) && (hd == SPI3_IOMUX_PIN_NUM_HD)) ||
-                    ((!args[ARG_quad_spi].u_bool) && (wp == -1) && (hd == -1))
-                ) &&
-                ((cs == -1) || (cs == SPI3_IOMUX_PIN_NUM_CS))
-            ) {
-                if (freq == -1) {
-                    freq = 80000000;
-                }
-                flags |= SPICOMMON_BUSFLAG_IOMUX_PINS;
-            } else {
-                if (freq == -1) {
-                    freq = 26600000;
-                }
-                flags |= SPICOMMON_BUSFLAG_GPIO_PINS;
-            }
-        #else
-            mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("spi host 2 is not supported by this board"));
-        #endif
-    } else {
-        mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("invalid spi host (%d)"), host);
-    }
-
-    self->callback = mp_const_none;
-
-    self->host = host;
-    self->bus_handle = (esp_lcd_spi_bus_handle_t)((uint32_t)host);
-
-    self->bus_config.sclk_io_num = sclk;
-    self->bus_config.mosi_io_num = mosi;
-    self->bus_config.miso_io_num = miso;
-    self->bus_config.quadwp_io_num = wp;
-    self->bus_config.quadhd_io_num = hd;
-    self->bus_config.data4_io_num = -1;
-    self->bus_config.data5_io_num = -1;
-    self->bus_config.data6_io_num = -1;
-    self->bus_config.data7_io_num = -1;
-    self->bus_config.flags = flags;
-
-    self->panel_io_config.cs_gpio_num = cs;
-    self->panel_io_config.dc_gpio_num = dc;
-    self->panel_io_config.spi_mode = args[ARG_spi_mode].u_int;
-    self->panel_io_config.pclk_hz = freq;
-    self->panel_io_config.trans_queue_depth = 1;
-    self->panel_io_config.on_color_trans_done = bus_trans_done_cb;
-    self->panel_io_config.user_ctx = self;
-    self->panel_io_config.lcd_cmd_bits = args[ARG_cmd_bits].u_int;
-    self->panel_io_config.lcd_param_bits = args[ARG_param_bits].u_int;
-    self->panel_io_config.flags.dc_low_on_data = args[ARG_dc_low_on_data].u_bool;
-    self->panel_io_config.flags.sio_mode = args[ARG_sio_mode].u_bool;
-    self->panel_io_config.flags.lsb_first = args[ARG_lsb_first].u_bool;
-    self->panel_io_config.flags.cs_high_active = args[ARG_cs_high_active].u_bool;
-    self->panel_io_config.flags.octal_mode = 0;
-
-    self->panel_io_handle.del = spi_del;
-    self->panel_io_handle.init = spi_init;
-    self->panel_io_handle.get_lane_count = spi_get_lane_count;
+    memset(self->trans, 0, sizeof(self->trans));
+    memset(self->ref_bufs, 0, sizeof(self->ref_bufs));
+    self->queue_head = self->queue_tail = self->queue_count = 0;
+    self->initialized = true;
 
     return MP_OBJ_FROM_PTR(self);
 }
 
 
-mp_lcd_err_t spi_del(lcd_panel_io_t *io) {
-    mp_lcd_spi_bus_obj_t *self = __containerof(io, mp_lcd_spi_bus_obj_t, panel_io_handle);
+static mp_obj_t spi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_self, ARG_buf };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_self, MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_buf,  MP_ARG_OBJ | MP_ARG_REQUIRED },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
-    mp_lcd_err_t ret = esp_lcd_panel_io_del(io->panel_io);
-    if (ret != 0) {
-        mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("%d(esp_lcd_panel_io_del)"), ret);
-    }
+    mp_lcd_spi_bus_obj_t *self = (mp_lcd_spi_bus_obj_t *)args[ARG_self].u_obj;
+    if (self->queue_count >= SPI_DMA_QUEUE_DEPTH)
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
 
-    ret = spi_bus_free(self->host);
-    if (ret != 0) {
-        mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("%d(spi_bus_free)"), ret);
-    }
-
-    gpio_pad_select_gpio(self->bus_config.miso_io_num);
-    gpio_matrix_out(self->bus_config.miso_io_num, SIG_GPIO_OUT_IDX, false, false);
-    gpio_set_direction(self->bus_config.miso_io_num, GPIO_MODE_INPUT);
-
-    gpio_pad_select_gpio(self->bus_config.mosi_io_num);
-    gpio_matrix_out(self->bus_config.mosi_io_num, SIG_GPIO_OUT_IDX, false, false);
-    gpio_set_direction(self->bus_config.mosi_io_num, GPIO_MODE_INPUT);
-
-    gpio_pad_select_gpio(self->bus_config.sclk_io_num);
-    gpio_matrix_out(self->bus_config.sclk_io_num, SIG_GPIO_OUT_IDX, false, false);
-    gpio_set_direction(self->bus_config.sclk_io_num, GPIO_MODE_INPUT);
-
-    return ret;
+    int tid = enqueue(self, args[ARG_buf].u_obj, NULL);
+    if (tid < 0) mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue failed"));
+    return mp_obj_new_int(tid);
 }
+static MP_DEFINE_CONST_FUN_OBJ_KW(spi_write_obj, 2, spi_write);
 
 
-mp_lcd_err_t spi_init(lcd_panel_io_t *io, uint16_t width, uint16_t height, uint8_t bpp, uint32_t buffer_size) {
-    mp_lcd_spi_bus_obj_t *self = __containerof(io, mp_lcd_spi_bus_obj_t, panel_io_handle);
+static mp_obj_t spi_readinto(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_self, ARG_buf, ARG_write_val };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_self,      MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_buf,       MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_write_val, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
-    self->bus_config.max_transfer_sz = (size_t)buffer_size;
+    mp_lcd_spi_bus_obj_t *self = (mp_lcd_spi_bus_obj_t *)args[ARG_self].u_obj;
+    if (self->queue_count >= SPI_DMA_QUEUE_DEPTH)
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
 
-    mp_lcd_err_t ret = spi_bus_initialize(self->host, &self->bus_config, SPI_DMA_CH_AUTO);
-    if (ret != 0) {
-        mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("%d(spi_bus_initialize)"), ret);
+    mp_obj_array_t *rx = (mp_obj_array_t *)args[ARG_buf].u_obj;
+    uint8_t val = (uint8_t)args[ARG_write_val].u_int;
+    if (val != 0) memset(self->zero_buf, val, rx->len);
+
+    int idx = self->queue_tail;
+    memset(&self->trans[idx], 0, sizeof(spi_transaction_t));
+    self->trans[idx].length    = rx->len * 8;
+    self->trans[idx].tx_buffer = self->zero_buf;
+    self->trans[idx].rx_buffer = rx->items;
+    self->trans[idx].flags     = lane_flag(self->lane_count);
+    self->trans[idx].user      = (void *)(uintptr_t)(idx + 1);
+    self->ref_bufs[idx] = args[ARG_buf].u_obj;
+
+    if (spi_device_queue_trans(self->handle, &self->trans[idx], 0) != ESP_OK) {
+        self->ref_bufs[idx] = mp_const_none;
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("readinto queue failed"));
     }
-
-    ret = esp_lcd_new_panel_io_spi(self->bus_handle, &self->panel_io_config, &io->panel_io);
-    if (ret != 0) {
-        mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("%d(esp_lcd_new_panel_io_spi)"), ret);
-    }
-
-    return ret;
+    self->queue_tail = (self->queue_tail + 1) % SPI_DMA_QUEUE_DEPTH;
+    self->queue_count++;
+    return mp_obj_new_int(idx + 1);
 }
+static MP_DEFINE_CONST_FUN_OBJ_KW(spi_readinto_obj, 2, spi_readinto);
 
 
-mp_lcd_err_t spi_get_lane_count(lcd_panel_io_t *io, uint8_t *lane_count) {
-    mp_lcd_spi_bus_obj_t *self = __containerof(io, mp_lcd_spi_bus_obj_t, panel_io_handle);
+static mp_obj_t spi_write_readinto(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_self, ARG_wbuf, ARG_rbuf };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_self, MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_wbuf, MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_rbuf, MP_ARG_OBJ | MP_ARG_REQUIRED },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
-    *lane_count = 1;
+    mp_lcd_spi_bus_obj_t *self = (mp_lcd_spi_bus_obj_t *)args[ARG_self].u_obj;
+    if (self->queue_count >= SPI_DMA_QUEUE_DEPTH)
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
 
-    if (self->panel_io_config.flags.sio_mode) {
-        *lane_count = 2;
+    mp_obj_array_t *w = (mp_obj_array_t *)args[ARG_wbuf].u_obj;
+    mp_obj_array_t *r = (mp_obj_array_t *)args[ARG_rbuf].u_obj;
+    size_t len = w->len; if (r->len < len) len = r->len;
+
+    int idx = self->queue_tail;
+    memset(&self->trans[idx], 0, sizeof(spi_transaction_t));
+    self->trans[idx].length    = len * 8;
+    self->trans[idx].tx_buffer = w->items;
+    self->trans[idx].rx_buffer = r->items;
+    self->trans[idx].flags     = lane_flag(self->lane_count);
+    self->trans[idx].user      = (void *)(uintptr_t)(idx + 1);
+    self->ref_bufs[idx] = args[ARG_rbuf].u_obj;
+
+    if (spi_device_queue_trans(self->handle, &self->trans[idx], 0) != ESP_OK) {
+        self->ref_bufs[idx] = mp_const_none;
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("write_readinto queue failed"));
     }
-    if (self->bus_config.quadwp_io_num != -1) {
-        *lane_count = 4;
-    }
-
-    return LCD_OK;
+    self->queue_tail = (self->queue_tail + 1) % SPI_DMA_QUEUE_DEPTH;
+    self->queue_count++;
+    return mp_obj_new_int(idx + 1);
 }
+static MP_DEFINE_CONST_FUN_OBJ_KW(spi_write_readinto_obj, 3, spi_write_readinto);
 
+
+static mp_obj_t spi_is_busy(mp_obj_t self_in) {
+    mp_lcd_spi_bus_obj_t *self = (mp_lcd_spi_bus_obj_t *)self_in;
+    return mp_obj_new_bool(self->queue_count > 0);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(spi_is_busy_obj, spi_is_busy);
+
+static mp_obj_t spi_pending(mp_obj_t self_in) {
+    mp_lcd_spi_bus_obj_t *self = (mp_lcd_spi_bus_obj_t *)self_in;
+    return mp_obj_new_int(self->queue_count);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(spi_pending_obj, spi_pending);
+
+static mp_obj_t spi_lane_count(mp_obj_t self_in) {
+    return mp_obj_new_int(((mp_lcd_spi_bus_obj_t *)self_in)->lane_count);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(spi_lane_count_obj, spi_lane_count);
+
+
+static mp_obj_t spi_wait(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_self, ARG_trans_id, ARG_timeout_ms };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_self,       MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_trans_id,   MP_ARG_INT | MP_ARG_REQUIRED },
+        { MP_QSTR_timeout_ms, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
+
+    mp_lcd_spi_bus_obj_t *self = (mp_lcd_spi_bus_obj_t *)args[ARG_self].u_obj;
+    int tid = args[ARG_trans_id].u_int;
+    int to = args[ARG_timeout_ms].u_int;
+    int idx = tid - 1;
+    if (idx < 0 || idx >= SPI_DMA_QUEUE_DEPTH) return mp_const_false;
+    if (self->ref_bufs[idx] == mp_const_none) return mp_const_true;
+
+    TickType_t tt = (to < 0) ? portMAX_DELAY : pdMS_TO_TICKS(to);
+    spi_transaction_t *rt;
+    if (spi_device_get_trans_result(self->handle, &rt, tt) != ESP_OK)
+        return mp_const_false;
+
+    int done = (int)(uintptr_t)rt->user - 1;
+    self->ref_bufs[done] = mp_const_none;
+    self->queue_head = (self->queue_head + 1) % SPI_DMA_QUEUE_DEPTH;
+    self->queue_count--;
+    return mp_const_true;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(spi_wait_obj, 2, spi_wait);
+
+
+static mp_obj_t spi_wait_all(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_self, ARG_timeout_ms };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_self,       MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_timeout_ms, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
+
+    mp_lcd_spi_bus_obj_t *self = (mp_lcd_spi_bus_obj_t *)args[ARG_self].u_obj;
+    int to = args[ARG_timeout_ms].u_int;
+
+    while (self->queue_count > 0) {
+        TickType_t tt = (to < 0) ? portMAX_DELAY : (to > 0) ? pdMS_TO_TICKS(to) : 0;
+        spi_transaction_t *rt;
+        if (spi_device_get_trans_result(self->handle, &rt, tt) != ESP_OK) break;
+        int done = (int)(uintptr_t)rt->user - 1;
+        self->ref_bufs[done] = mp_const_none;
+        self->queue_head = (self->queue_head + 1) % SPI_DMA_QUEUE_DEPTH;
+        self->queue_count--;
+    }
+    gc_collect();
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(spi_wait_all_obj, 1, spi_wait_all);
+
+
+static mp_obj_t spi_deinit(mp_obj_t self_in) {
+    mp_lcd_spi_bus_obj_t *self = (mp_lcd_spi_bus_obj_t *)self_in;
+    if (!self->initialized) return mp_const_none;
+    spi_bus_remove_device(self->handle);
+    spi_bus_free(self->host);
+    if (self->zero_buf) { heap_caps_free(self->zero_buf); self->zero_buf = NULL; }
+    self->initialized = false;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(spi_deinit_obj, spi_deinit);
+
+
+static const mp_rom_map_elem_t spi_locals_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_write),          MP_ROM_PTR(&spi_write_obj) },
+    { MP_ROM_QSTR(MP_QSTR_readinto),       MP_ROM_PTR(&spi_readinto_obj) },
+    { MP_ROM_QSTR(MP_QSTR_write_readinto), MP_ROM_PTR(&spi_write_readinto_obj) },
+    { MP_ROM_QSTR(MP_QSTR_is_busy),        MP_ROM_PTR(&spi_is_busy_obj) },
+    { MP_ROM_QSTR(MP_QSTR_pending),        MP_ROM_PTR(&spi_pending_obj) },
+    { MP_ROM_QSTR(MP_QSTR_wait),           MP_ROM_PTR(&spi_wait_obj) },
+    { MP_ROM_QSTR(MP_QSTR_wait_all),       MP_ROM_PTR(&spi_wait_all_obj) },
+    { MP_ROM_QSTR(MP_QSTR_lane_count),     MP_ROM_PTR(&spi_lane_count_obj) },
+    { MP_ROM_QSTR(MP_QSTR_deinit),         MP_ROM_PTR(&spi_deinit_obj) },
+    { MP_ROM_QSTR(MP_QSTR___del__),        MP_ROM_PTR(&spi_deinit_obj) },
+};
+static MP_DEFINE_CONST_DICT(spi_locals_dict, spi_locals_table);
 
 MP_DEFINE_CONST_OBJ_TYPE(
     mp_lcd_spi_bus_type,
-    MP_QSTR_SPI_Bus,
+    MP_QSTR_SPIBus,
     MP_TYPE_FLAG_NONE,
-    make_new, mp_lcd_spi_bus_make_new,
-    locals_dict, (mp_obj_dict_t *)&mp_lcd_bus_locals_dict
+    make_new, spi_make_new,
+    locals_dict, (mp_obj_dict_t *)&spi_locals_dict
 );

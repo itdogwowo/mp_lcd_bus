@@ -1,219 +1,232 @@
-// local includes
-#include "lcd_types.h"
-#include "modlcd_bus.h"
-#include "i80_bus.h"
-
-// micropython includes
-#include "mphalport.h"
-#include "py/obj.h"
-#include "py/runtime.h"
-
-// stdlib includes
-#include <string.h>
+#include "soc/soc_caps.h"
 
 #if SOC_LCD_I80_SUPPORTED
-    // esp-idf includes
-    #include "soc/soc_caps.h"
-    #include "esp_lcd_panel_io.h"
-    #include "esp_heap_caps.h"
-    #include "hal/lcd_types.h"
 
-    mp_lcd_err_t i80_del(lcd_panel_io_t *io);
-    mp_lcd_err_t i80_init(lcd_panel_io_t *io, uint16_t width, uint16_t height, uint8_t bpp, uint32_t buffer_size);
-    mp_lcd_err_t i80_get_lane_count(lcd_panel_io_t *io, uint8_t *lane_count);
-    
-    static mp_obj_t mp_lcd_i80_bus_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args)
-    {
-    
-        enum {
-            ARG_dc,
-            ARG_wr,
-            ARG_data0,
-            ARG_data1,
-            ARG_data2,
-            ARG_data3,
-            ARG_data4,
-            ARG_data5,
-            ARG_data6,
-            ARG_data7,
-            ARG_data8,
-            ARG_data9,
-            ARG_data10,
-            ARG_data11,
-            ARG_data12,
-            ARG_data13,
-            ARG_data14,
-            ARG_data15,
-            ARG_cs,
-            ARG_freq,
-            ARG_dc_idle_high,
-            ARG_dc_cmd_high,
-            ARG_dc_dummy_high,
-            ARG_dc_data_high,
-            ARG_cmd_bits,
-            ARG_param_bits,
-            ARG_cs_active_high,
-            ARG_reverse_color_bits,
-            ARG_swap_color_bytes,
-            ARG_pclk_active_low,
-            ARG_pclk_idle_low,
-        };
+#include "i80_bus.h"
+#include "esp_lcd_types.h"
+#include "hal/lcd_types.h"
+#include "esp_heap_caps.h"
 
-        const mp_arg_t make_new_args[] = {
-            { MP_QSTR_dc,                 MP_ARG_INT  | MP_ARG_REQUIRED                        },
-            { MP_QSTR_wr,                 MP_ARG_INT  | MP_ARG_REQUIRED                        },
-            { MP_QSTR_data0,              MP_ARG_INT  | MP_ARG_REQUIRED                        },
-            { MP_QSTR_data1,              MP_ARG_INT  | MP_ARG_REQUIRED                        },
-            { MP_QSTR_data2,              MP_ARG_INT  | MP_ARG_REQUIRED                        },
-            { MP_QSTR_data3,              MP_ARG_INT  | MP_ARG_REQUIRED                        },
-            { MP_QSTR_data4,              MP_ARG_INT  | MP_ARG_REQUIRED                        },
-            { MP_QSTR_data5,              MP_ARG_INT  | MP_ARG_REQUIRED                        },
-            { MP_QSTR_data6,              MP_ARG_INT  | MP_ARG_REQUIRED                        },
-            { MP_QSTR_data7,              MP_ARG_INT  | MP_ARG_REQUIRED                        },
-            { MP_QSTR_data8,              MP_ARG_INT  | MP_ARG_KW_ONLY,  { .u_int = -1       } },
-            { MP_QSTR_data9,              MP_ARG_INT  | MP_ARG_KW_ONLY,  { .u_int = -1       } },
-            { MP_QSTR_data10,             MP_ARG_INT  | MP_ARG_KW_ONLY,  { .u_int = -1       } },
-            { MP_QSTR_data11,             MP_ARG_INT  | MP_ARG_KW_ONLY,  { .u_int = -1       } },
-            { MP_QSTR_data12,             MP_ARG_INT  | MP_ARG_KW_ONLY,  { .u_int = -1       } },
-            { MP_QSTR_data13,             MP_ARG_INT  | MP_ARG_KW_ONLY,  { .u_int = -1       } },
-            { MP_QSTR_data14,             MP_ARG_INT  | MP_ARG_KW_ONLY,  { .u_int = -1       } },
-            { MP_QSTR_data15,             MP_ARG_INT  | MP_ARG_KW_ONLY,  { .u_int = -1       } },
-            { MP_QSTR_cs,                 MP_ARG_INT  | MP_ARG_KW_ONLY,  { .u_int = -1       } },
-            { MP_QSTR_freq,               MP_ARG_INT  | MP_ARG_KW_ONLY,  { .u_int = 10000000 } },
-            { MP_QSTR_dc_idle_high,       MP_ARG_BOOL | MP_ARG_KW_ONLY,  { .u_bool = false  } },
-            { MP_QSTR_dc_cmd_high,        MP_ARG_BOOL | MP_ARG_KW_ONLY,  { .u_bool = false  } },
-            { MP_QSTR_dc_dummy_high,      MP_ARG_BOOL | MP_ARG_KW_ONLY,  { .u_bool = false  } },
-            { MP_QSTR_dc_data_high,       MP_ARG_BOOL | MP_ARG_KW_ONLY,  { .u_bool = true   } },
-            { MP_QSTR_cmd_bits,           MP_ARG_INT  | MP_ARG_KW_ONLY,  { .u_int = 8        } },
-            { MP_QSTR_param_bits,         MP_ARG_INT  | MP_ARG_KW_ONLY,  { .u_int = 8        } },
-            { MP_QSTR_cs_active_high,     MP_ARG_BOOL | MP_ARG_KW_ONLY,  { .u_bool = false   } },
-            { MP_QSTR_reverse_color_bits, MP_ARG_BOOL | MP_ARG_KW_ONLY,  { .u_bool = false   } },
-            { MP_QSTR_swap_color_bytes,   MP_ARG_BOOL | MP_ARG_KW_ONLY,  { .u_bool = false   } },
-            { MP_QSTR_pclk_active_low,    MP_ARG_BOOL | MP_ARG_KW_ONLY,  { .u_bool = false   } },
-            { MP_QSTR_pclk_idle_low,      MP_ARG_BOOL | MP_ARG_KW_ONLY,  { .u_bool = false   } }
-        };
-    
-        mp_arg_val_t args[MP_ARRAY_SIZE(make_new_args)];
-        mp_arg_parse_all_kw_array(
-            n_args,
-            n_kw,
-            all_args,
-            MP_ARRAY_SIZE(make_new_args),
-            make_new_args,
-            args
-        );
-    
-        // create new object
-        mp_lcd_i80_bus_obj_t *self = m_new_obj(mp_lcd_i80_bus_obj_t);
-        self->base.type = &mp_lcd_i80_bus_type;
-    
-        self->callback = mp_const_none;
+#include "py/runtime.h"
+#include "py/objarray.h"
+#include "py/mphal.h"
 
-        self->bus_config.dc_gpio_num = (int)args[ARG_dc].u_int;
-        self->bus_config.wr_gpio_num = (int)args[ARG_wr].u_int;
-        self->bus_config.clk_src = LCD_CLK_SRC_PLL160M;
-        self->bus_config.data_gpio_nums[0] = args[ARG_data0].u_int;
-        self->bus_config.data_gpio_nums[1] = args[ARG_data1].u_int;
-        self->bus_config.data_gpio_nums[2] = args[ARG_data2].u_int;
-        self->bus_config.data_gpio_nums[3] = args[ARG_data3].u_int;
-        self->bus_config.data_gpio_nums[4] = args[ARG_data4].u_int;
-        self->bus_config.data_gpio_nums[5] = args[ARG_data5].u_int;
-        self->bus_config.data_gpio_nums[6] = args[ARG_data6].u_int;
-        self->bus_config.data_gpio_nums[7] = args[ARG_data7].u_int;
-        self->bus_config.data_gpio_nums[8] = args[ARG_data8].u_int;
-        self->bus_config.data_gpio_nums[9] = args[ARG_data9].u_int;
-        self->bus_config.data_gpio_nums[10] = args[ARG_data10].u_int;
-        self->bus_config.data_gpio_nums[11] = args[ARG_data11].u_int;
-        self->bus_config.data_gpio_nums[12] = args[ARG_data12].u_int;
-        self->bus_config.data_gpio_nums[13] = args[ARG_data13].u_int;
-        self->bus_config.data_gpio_nums[14] = args[ARG_data14].u_int;
-        self->bus_config.data_gpio_nums[15] = args[ARG_data15].u_int;
+#include <string.h>
 
-        uint8_t i = 0;
-        for (; i < SOC_LCD_I80_BUS_WIDTH; i++) {
-            if (self->bus_config.data_gpio_nums[i] == -1) {
-                break;
-            }
+static mp_lcd_i80_bus_obj_t *i80_active = NULL;
+
+static bool on_color_done(esp_lcd_panel_io_handle_t panel_io,
+                          esp_lcd_panel_io_event_data_t *edata, void *ctx) {
+    mp_lcd_i80_bus_obj_t *self = (mp_lcd_i80_bus_obj_t *)ctx;
+    for (int i = 0; i < I80_DMA_QUEUE_DEPTH; i++) {
+        if (self->ref_bufs[i] != mp_const_none && !self->done_flags[i]) {
+            self->done_flags[i] = true;
+            self->ref_bufs[i] = mp_const_none;
+            self->queue_head = (self->queue_head + 1) % I80_DMA_QUEUE_DEPTH;
+            self->queue_count--;
+            break;
         }
-
-        self->bus_config.bus_width = (size_t) i;
-
-        self->panel_io_config.cs_gpio_num = (int)args[ARG_cs].u_int;
-        self->panel_io_config.pclk_hz = (uint32_t)args[ARG_freq].u_int;
-        self->panel_io_config.trans_queue_depth = 1;
-        self->panel_io_config.on_color_trans_done = bus_trans_done_cb;
-        self->panel_io_config.user_ctx = self;
-        self->panel_io_config.lcd_cmd_bits = (int)args[ARG_cmd_bits].u_int;
-        self->panel_io_config.lcd_param_bits = (int)args[ARG_param_bits].u_int;
-        self->panel_io_config.dc_levels.dc_idle_level = (unsigned int)args[ARG_dc_idle_high].u_bool;
-        self->panel_io_config.dc_levels.dc_cmd_level = (unsigned int)args[ARG_dc_cmd_high].u_bool;
-        self->panel_io_config.dc_levels.dc_dummy_level = (unsigned int)args[ARG_dc_dummy_high].u_bool;
-        self->panel_io_config.dc_levels.dc_data_level = (unsigned int)args[ARG_dc_data_high].u_bool;
-        self->panel_io_config.flags.cs_active_high = (unsigned int)args[ARG_cs_active_high].u_bool;
-        self->panel_io_config.flags.reverse_color_bits = (unsigned int)args[ARG_reverse_color_bits].u_bool;
-        self->panel_io_config.flags.swap_color_bytes = (unsigned int)args[ARG_swap_color_bytes].u_bool;
-        self->panel_io_config.flags.pclk_active_neg = (unsigned int)args[ARG_pclk_active_low].u_bool;
-        self->panel_io_config.flags.pclk_idle_low = (unsigned int)args[ARG_pclk_idle_low].u_bool;
-
-        self->panel_io_handle.init = i80_init;
-        self->panel_io_handle.del = i80_del;
-        self->panel_io_handle.get_lane_count = i80_get_lane_count;
-
-        return MP_OBJ_FROM_PTR(self);
     }
-    
+    return false;
+}
 
-    mp_lcd_err_t i80_init(lcd_panel_io_t *io, uint16_t width, uint16_t height, uint8_t bpp, uint32_t buffer_size) {
-        mp_lcd_i80_bus_obj_t *self = __containerof(io, mp_lcd_i80_bus_obj_t, panel_io_handle);
 
-        self->bus_config.max_transfer_bytes = (size_t)buffer_size;
+static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
+    enum { ARG_data, ARG_wr, ARG_cs, ARG_freq };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_data, MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_wr,   MP_ARG_INT | MP_ARG_REQUIRED },
+        { MP_QSTR_cs,   MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
+        { MP_QSTR_freq, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 10000000} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
-        esp_err_t ret = esp_lcd_new_i80_bus(&self->bus_config, &self->bus_handle);
+    size_t n;
+    mp_obj_t *items;
+    mp_obj_get_array(args[ARG_data].u_obj, &n, &items);
+    if (n != 8 && n != 16)
+        mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("I80 data pins must be 8 or 16"));
 
-        if (ret != 0) {
-            mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("%d(esp_lcd_new_i80_bus)"), ret);
-        }
+    mp_lcd_i80_bus_obj_t *self = m_new_obj(mp_lcd_i80_bus_obj_t);
+    self->base.type = &mp_lcd_i80_bus_type;
+    self->lane_count = (int)n;
+    self->wr_pin = args[ARG_wr].u_int;
+    self->cs_pin = args[ARG_cs].u_int;
+    self->freq   = args[ARG_freq].u_int;
 
-        ret = esp_lcd_new_panel_io_i80(self->bus_handle, &self->panel_io_config, &self->panel_io_handle.panel_io);
+    for (int i = 0; i < 16; i++)
+        self->data_pins[i] = (i < (int)n) ? mp_obj_get_int(items[i]) : -1;
 
-        if (ret != 0) {
-            mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("%d(esp_lcd_new_panel_io_i80)"), ret);
-        }
+    esp_lcd_i80_bus_config_t bcfg = {
+        .dc_gpio_num = -1,
+        .wr_gpio_num = self->wr_pin,
+        .clk_src     = LCD_CLK_SRC_PLL160M,
+        .bus_width   = (size_t)n,
+        .max_transfer_bytes = 32768,
+        .psram_trans_align = 64,
+        .sram_trans_align  = 64,
+    };
+    for (int i = 0; i < 16; i++) bcfg.data_gpio_nums[i] = self->data_pins[i];
 
-        return ret;
+    if (esp_lcd_new_i80_bus(&bcfg, &self->bus_handle) != ESP_OK) {
+        m_del_obj(mp_lcd_i80_bus_obj_t, self);
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("esp_lcd_new_i80_bus"));
     }
 
-    mp_lcd_err_t i80_del(lcd_panel_io_t *io) {
-        mp_lcd_i80_bus_obj_t *self = __containerof(io, mp_lcd_i80_bus_obj_t, panel_io_handle);
+    esp_lcd_panel_io_i80_config_t iocfg = {
+        .cs_gpio_num   = self->cs_pin,
+        .pclk_hz       = (uint32_t)self->freq,
+        .trans_queue_depth = I80_DMA_QUEUE_DEPTH,
+        .on_color_trans_done = on_color_done,
+        .user_ctx      = self,
+        .lcd_cmd_bits  = 8,
+        .lcd_param_bits = 8,
+        .dc_levels = { .dc_idle_level = 0, .dc_cmd_level = 0, .dc_dummy_level = 0, .dc_data_level = 1 },
+    };
 
-        mp_lcd_err_t ret = esp_lcd_panel_io_del(self->panel_io_handle.panel_io);
-        if (ret != 0) {
-            mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("%d(esp_lcd_panel_io_del)"), ret);
-        }
-
-        ret = esp_lcd_del_i80_bus(self->bus_handle);
-        if (ret != 0) {
-            mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("%d(esp_lcd_del_i80_bus)"), ret);
-        }
-
-        return ret;
+    if (esp_lcd_new_panel_io_i80(self->bus_handle, &iocfg, &self->panel_io) != ESP_OK) {
+        esp_lcd_del_i80_bus(self->bus_handle);
+        m_del_obj(mp_lcd_i80_bus_obj_t, self);
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("esp_lcd_new_panel_io_i80"));
     }
 
-    mp_lcd_err_t i80_get_lane_count(lcd_panel_io_t *io, uint8_t *lane_count) {
-        mp_lcd_i80_bus_obj_t *self = __containerof(io, mp_lcd_i80_bus_obj_t, panel_io_handle);
-        *lane_count = (uint8_t)self->bus_config.bus_width;
-        return LCD_OK;
+    memset(self->ref_bufs, 0, sizeof(self->ref_bufs));
+    memset(self->done_flags, 0, sizeof(self->done_flags));
+    self->queue_head = self->queue_tail = self->queue_count = 0;
+    self->initialized = true;
+
+    return MP_OBJ_FROM_PTR(self);
+}
+
+
+static mp_obj_t i80_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_self, ARG_buf };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_self, MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_buf,  MP_ARG_OBJ | MP_ARG_REQUIRED },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
+
+    mp_lcd_i80_bus_obj_t *self = (mp_lcd_i80_bus_obj_t *)args[ARG_self].u_obj;
+    mp_obj_array_t *a = (mp_obj_array_t *)args[ARG_buf].u_obj;
+
+    if (self->queue_count >= I80_DMA_QUEUE_DEPTH)
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
+
+    int idx = self->queue_tail;
+    self->ref_bufs[idx] = args[ARG_buf].u_obj;
+    self->done_flags[idx] = false;
+
+    if (esp_lcd_panel_io_tx_color(self->panel_io, -1, a->items, a->len) != ESP_OK) {
+        self->ref_bufs[idx] = mp_const_none;
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_color failed"));
     }
 
-    MP_DEFINE_CONST_OBJ_TYPE(
-        mp_lcd_i80_bus_type,
-        MP_QSTR_I80Bus,
-        MP_TYPE_FLAG_NONE,
-        make_new, mp_lcd_i80_bus_make_new,
-        locals_dict, (mp_obj_dict_t *)&mp_lcd_bus_locals_dict
-    );
+    self->queue_tail = (self->queue_tail + 1) % I80_DMA_QUEUE_DEPTH;
+    self->queue_count++;
+    return mp_obj_new_int(idx + 1);
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(i80_write_obj, 2, i80_write);
 
-#else
-    #include "../common_src/i80_bus.c"
 
-#endif /*SOC_LCD_I80_SUPPORTED*/
+static mp_obj_t i80_is_busy(mp_obj_t self_in) {
+    return mp_obj_new_bool(((mp_lcd_i80_bus_obj_t *)self_in)->queue_count > 0);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(i80_is_busy_obj, i80_is_busy);
+
+static mp_obj_t i80_pending(mp_obj_t self_in) {
+    return mp_obj_new_int(((mp_lcd_i80_bus_obj_t *)self_in)->queue_count);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(i80_pending_obj, i80_pending);
+
+static mp_obj_t i80_lane_count(mp_obj_t self_in) {
+    return mp_obj_new_int(((mp_lcd_i80_bus_obj_t *)self_in)->lane_count);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(i80_lane_count_obj, i80_lane_count);
+
+
+static mp_obj_t i80_wait(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_self, ARG_trans_id, ARG_timeout_ms };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_self,       MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_trans_id,   MP_ARG_INT | MP_ARG_REQUIRED },
+        { MP_QSTR_timeout_ms, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
+
+    mp_lcd_i80_bus_obj_t *self = (mp_lcd_i80_bus_obj_t *)args[ARG_self].u_obj;
+    int tid = args[ARG_trans_id].u_int;
+    int to  = args[ARG_timeout_ms].u_int;
+    int idx = tid - 1;
+
+    if (idx < 0 || idx >= I80_DMA_QUEUE_DEPTH) return mp_const_false;
+    if (self->ref_bufs[idx] == mp_const_none) return mp_const_true;
+
+    mp_uint_t deadline = mp_hal_ticks_ms() + (to < 0 ? 10000 : to);
+    while (!self->done_flags[idx]) {
+        if (to >= 0 && mp_hal_ticks_ms() > deadline) return mp_const_false;
+        mp_hal_delay_ms(1);
+    }
+    return mp_const_true;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(i80_wait_obj, 2, i80_wait);
+
+
+static mp_obj_t i80_wait_all(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_self, ARG_timeout_ms };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_self,       MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_timeout_ms, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
+
+    mp_lcd_i80_bus_obj_t *self = (mp_lcd_i80_bus_obj_t *)args[ARG_self].u_obj;
+    int to = args[ARG_timeout_ms].u_int;
+    mp_uint_t deadline = mp_hal_ticks_ms() + (to < 0 ? 10000 : to);
+
+    while (self->queue_count > 0) {
+        if (to >= 0 && mp_hal_ticks_ms() > deadline) break;
+        mp_hal_delay_ms(1);
+    }
+    gc_collect();
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(i80_wait_all_obj, 1, i80_wait_all);
+
+
+static mp_obj_t i80_deinit(mp_obj_t self_in) {
+    mp_lcd_i80_bus_obj_t *self = (mp_lcd_i80_bus_obj_t *)self_in;
+    if (!self->initialized) return mp_const_none;
+    esp_lcd_panel_io_del(self->panel_io);
+    esp_lcd_del_i80_bus(self->bus_handle);
+    self->initialized = false;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(i80_deinit_obj, i80_deinit);
+
+
+static const mp_rom_map_elem_t i80_locals_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_write),      MP_ROM_PTR(&i80_write_obj) },
+    { MP_ROM_QSTR(MP_QSTR_is_busy),    MP_ROM_PTR(&i80_is_busy_obj) },
+    { MP_ROM_QSTR(MP_QSTR_pending),    MP_ROM_PTR(&i80_pending_obj) },
+    { MP_ROM_QSTR(MP_QSTR_wait),       MP_ROM_PTR(&i80_wait_obj) },
+    { MP_ROM_QSTR(MP_QSTR_wait_all),   MP_ROM_PTR(&i80_wait_all_obj) },
+    { MP_ROM_QSTR(MP_QSTR_lane_count), MP_ROM_PTR(&i80_lane_count_obj) },
+    { MP_ROM_QSTR(MP_QSTR_deinit),     MP_ROM_PTR(&i80_deinit_obj) },
+    { MP_ROM_QSTR(MP_QSTR___del__),    MP_ROM_PTR(&i80_deinit_obj) },
+};
+static MP_DEFINE_CONST_DICT(i80_locals_dict, i80_locals_table);
+
+MP_DEFINE_CONST_OBJ_TYPE(
+    mp_lcd_i80_bus_type,
+    MP_QSTR_I80Bus,
+    MP_TYPE_FLAG_NONE,
+    make_new, i80_make_new,
+    locals_dict, (mp_obj_dict_t *)&i80_locals_dict
+);
+
+#endif

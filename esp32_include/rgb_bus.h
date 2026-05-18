@@ -1,46 +1,33 @@
 #include "soc/soc_caps.h"
 
 #if SOC_LCD_RGB_SUPPORTED
-    #ifndef _ESP32_RGB_BUS_H_
-        #define _ESP32_RGB_BUS_H_
 
-        //local_includes
-        #include "lcd_types.h"
+#ifndef _ESP32_RGB_BUS_H_
+#define _ESP32_RGB_BUS_H_
 
+#include "esp_lcd_panel_rgb.h"
+#include "py/obj.h"
 
-        // esp-idf includes
-        #include "esp_lcd_panel_io.h"
-        #include "esp_lcd_panel_rgb.h"
+#define RGB_DMA_QUEUE_DEPTH 2
 
-        // micropython includes
-        #include "mphalport.h"
-        #include "py/obj.h"
-        #include "py/objarray.h"
-        #include "soc/soc_caps.h"
+typedef struct _mp_lcd_rgb_bus_obj_t {
+    mp_obj_base_t base;
 
+    esp_lcd_panel_handle_t panel_handle;
 
-        typedef struct _mp_lcd_rgb_bus_obj_t {
-            mp_obj_base_t base;
+    mp_obj_t ref_bufs[RGB_DMA_QUEUE_DEPTH];
+    bool done_flags[RGB_DMA_QUEUE_DEPTH];
+    int queue_head, queue_tail, queue_count;
 
-            mp_obj_t callback;
+    int lane_count;
+    int data_pins[16];
+    int hsync_pin, vsync_pin, de_pin, pclk_pin, disp_pin;
+    int panel_w, panel_h, freq;
 
-            bool trans_done;
-            bool rgb565_byte_swap;
+    bool initialized;
+} mp_lcd_rgb_bus_obj_t;
 
-            lcd_panel_io_t panel_io_handle;
+extern const mp_obj_type_t mp_lcd_rgb_bus_type;
 
-            esp_lcd_rgb_panel_config_t panel_io_config;
-            esp_lcd_rgb_timing_t bus_config;
-
-            esp_lcd_panel_handle_t panel_handle;
-
-        } mp_lcd_rgb_bus_obj_t;
-
-
-        extern const mp_obj_type_t mp_lcd_rgb_bus_type;
-
-    #endif /* _ESP32_RGB_BUS_H_ */
-#else
-    #include "../common_include/rgb_bus.h"
-
-#endif /*SOC_LCD_RGB_SUPPORTED*/
+#endif
+#endif

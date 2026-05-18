@@ -1,156 +1,159 @@
-
-// local includes
-#include "lcd_types.h"
-#include "modlcd_bus.h"
 #include "i2c_bus.h"
-
-// esp-idf includes
-#include "esp_lcd_panel_io.h"
-#include "driver/i2c.h"
-
-// micropython includes
-#include "mphalport.h"
-#include "py/obj.h"
 #include "py/runtime.h"
+#include "py/objarray.h"
 
-// stdlib includes
-#include <string.h>
-
-
-
-mp_lcd_err_t i2c_del(lcd_panel_io_t *io);
-mp_lcd_err_t i2c_init(lcd_panel_io_t *io, uint16_t width, uint16_t height, uint8_t bpp, uint32_t buffer_size);
-mp_lcd_err_t i2c_get_lane_count(lcd_panel_io_t *io, uint8_t *lane_count);
-
-
-static mp_obj_t mp_lcd_i2c_bus_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args)
-{
-    enum {
-        ARG_sda,
-        ARG_scl,
-        ARG_addr,
-        ARG_host,
-        ARG_control_phase_bytes,
-        ARG_dc_bit_offset,
-        ARG_freq,
-        ARG_cmd_bits,
-        ARG_param_bits,
-        ARG_dc_low_on_data,
-        ARG_sda_pullup,
-        ARG_scl_pullup,
-        ARG_disable_control_phase
+static mp_obj_t i2c_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
+    enum { ARG_data, ARG_clk, ARG_addr, ARG_freq };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_data, MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_clk,  MP_ARG_INT | MP_ARG_REQUIRED },
+        { MP_QSTR_addr, MP_ARG_INT | MP_ARG_REQUIRED },
+        { MP_QSTR_freq, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 10000000} },
     };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
-    const mp_arg_t make_new_args[] = {
-        { MP_QSTR_sda,                   MP_ARG_INT  | MP_ARG_REQUIRED                        },
-        { MP_QSTR_scl,                   MP_ARG_INT  | MP_ARG_REQUIRED                        },
-        { MP_QSTR_addr,                  MP_ARG_INT  | MP_ARG_REQUIRED                        },
-        { MP_QSTR_host,                  MP_ARG_INT  | MP_ARG_KW_ONLY,  {.u_int = 0         } },
-        { MP_QSTR_control_phase_bytes,   MP_ARG_INT  | MP_ARG_KW_ONLY,  {.u_int = 1         } },
-        { MP_QSTR_dc_bit_offset,         MP_ARG_INT  | MP_ARG_KW_ONLY,  {.u_int = 6         } },
-        { MP_QSTR_freq,                  MP_ARG_INT  | MP_ARG_KW_ONLY,  {.u_int = 10000000  } },
-        { MP_QSTR_cmd_bits,              MP_ARG_INT  | MP_ARG_KW_ONLY,  {.u_int = 8         } },
-        { MP_QSTR_param_bits,            MP_ARG_INT  | MP_ARG_KW_ONLY,  {.u_int = 8         } },
-        { MP_QSTR_dc_low_on_data,        MP_ARG_BOOL | MP_ARG_KW_ONLY,  {.u_bool = false    } },
-        { MP_QSTR_sda_pullup,            MP_ARG_BOOL | MP_ARG_KW_ONLY,  {.u_bool = true     } },
-        { MP_QSTR_scl_pullup,            MP_ARG_BOOL | MP_ARG_KW_ONLY,  {.u_bool = true     } },
-        { MP_QSTR_disable_control_phase, MP_ARG_BOOL | MP_ARG_KW_ONLY,  {.u_bool = false    } }
-    };
+    size_t n;
+    mp_obj_t *items;
+    mp_obj_get_array(args[ARG_data].u_obj, &n, &items);
+    if (n != 1) mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("I2C data expects 1 pin (sda)"));
 
-    mp_arg_val_t args[MP_ARRAY_SIZE(make_new_args)];
-    mp_arg_parse_all_kw_array(
-        n_args,
-        n_kw,
-        all_args,
-        MP_ARRAY_SIZE(make_new_args),
-        make_new_args,
-        args
-    );
-
-    // create new object
     mp_lcd_i2c_bus_obj_t *self = m_new_obj(mp_lcd_i2c_bus_obj_t);
     self->base.type = &mp_lcd_i2c_bus_type;
 
-    self->callback = mp_const_none;
-
-    self->host = args[ARG_host].u_int;
-    self->bus_handle = (esp_lcd_i2c_bus_handle_t)((uint32_t)self->host);
+    self->sda_pin = mp_obj_get_int(items[0]);
+    self->scl_pin = args[ARG_clk].u_int;
+    self->addr    = args[ARG_addr].u_int;
+    self->freq    = args[ARG_freq].u_int;
+    self->host    = 0;
 
     self->bus_config.mode = I2C_MODE_MASTER;
-    self->bus_config.sda_io_num = (int)args[ARG_sda].u_int;
-    self->bus_config.scl_io_num = (int)args[ARG_scl].u_int;
-    self->bus_config.sda_pullup_en = (bool)args[ARG_sda_pullup].u_bool;
-    self->bus_config.scl_pullup_en = (bool)args[ARG_scl_pullup].u_bool;
-    self->bus_config.master.clk_speed = (uint32_t)args[ARG_freq].u_int;
+    self->bus_config.sda_io_num = self->sda_pin;
+    self->bus_config.scl_io_num = self->scl_pin;
+    self->bus_config.sda_pullup_en = true;
+    self->bus_config.scl_pullup_en = true;
+    self->bus_config.master.clk_speed = (uint32_t)self->freq;
     self->bus_config.clk_flags = I2C_SCLK_SRC_FLAG_FOR_NOMAL;
+    self->bus_handle = (esp_lcd_i2c_bus_handle_t)((uint32_t)self->host);
 
-    self->panel_io_config.dev_addr = (uint32_t)args[ARG_addr].u_int;
-    self->panel_io_config.on_color_trans_done = bus_trans_done_cb;
-    self->panel_io_config.user_ctx = self;
-    self->panel_io_config.control_phase_bytes = (size_t)args[ARG_control_phase_bytes].u_int;
-    self->panel_io_config.dc_bit_offset = (unsigned int)args[ARG_dc_bit_offset].u_int;
-    self->panel_io_config.lcd_cmd_bits = (int)args[ARG_cmd_bits].u_int;
-    self->panel_io_config.lcd_param_bits = (int)args[ARG_param_bits].u_int;
-    self->panel_io_config.flags.dc_low_on_data = (unsigned int)args[ARG_dc_low_on_data].u_bool;
-    self->panel_io_config.flags.disable_control_phase = (unsigned int)args[ARG_disable_control_phase].u_bool;
+    if (i2c_param_config(self->host, &self->bus_config) != ESP_OK) {
+        m_del_obj(mp_lcd_i2c_bus_obj_t, self);
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("i2c_param_config"));
+    }
+    if (i2c_driver_install(self->host, I2C_MODE_MASTER, 0, 0, 0) != ESP_OK) {
+        m_del_obj(mp_lcd_i2c_bus_obj_t, self);
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("i2c_driver_install"));
+    }
 
-    self->panel_io_handle.del = i2c_del;
-    self->panel_io_handle.init = i2c_init;
-    self->panel_io_handle.get_lane_count = i2c_get_lane_count;
+    esp_lcd_panel_io_i2c_config_t iocfg = {
+        .dev_addr = (uint32_t)self->addr,
+        .control_phase_bytes = 1,
+        .dc_bit_offset = 6,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+        .flags = { .dc_low_on_data = false, .disable_control_phase = false },
+    };
 
+    if (esp_lcd_new_panel_io_i2c(self->bus_handle, &iocfg, &self->panel_io) != ESP_OK) {
+        i2c_driver_delete(self->host);
+        m_del_obj(mp_lcd_i2c_bus_obj_t, self);
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("esp_lcd_new_panel_io_i2c"));
+    }
+
+    self->initialized = true;
     return MP_OBJ_FROM_PTR(self);
 }
 
-mp_lcd_err_t i2c_del(lcd_panel_io_t *io) {
-    mp_lcd_i2c_bus_obj_t *self = __containerof(io, mp_lcd_i2c_bus_obj_t, panel_io_handle);
 
-    mp_lcd_err_t ret = esp_lcd_panel_io_del(io->panel_io);
-    if (ret != 0) {
-        mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("%d(esp_lcd_panel_io_del)"), ret);
-    }
-    ret = i2c_driver_delete(self->host);
-    if (ret != 0) {
-        mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("%d(i2c_driver_delete)"), ret);
-    }
+static mp_obj_t i2c_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_self, ARG_buf };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_self, MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_buf,  MP_ARG_OBJ | MP_ARG_REQUIRED },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
-    return ret;
+    mp_lcd_i2c_bus_obj_t *self = (mp_lcd_i2c_bus_obj_t *)args[ARG_self].u_obj;
+    mp_obj_array_t *a = (mp_obj_array_t *)args[ARG_buf].u_obj;
+
+    if (esp_lcd_panel_io_tx_color(self->panel_io, -1, a->items, a->len) != ESP_OK)
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("i2c write failed"));
+    return mp_obj_new_int(0);
 }
+static MP_DEFINE_CONST_FUN_OBJ_KW(i2c_write_obj, 2, i2c_write);
 
 
-mp_lcd_err_t i2c_init(lcd_panel_io_t *io, uint16_t width, uint16_t height, uint8_t bpp, uint32_t buffer_size) {
-    mp_lcd_i2c_bus_obj_t *self = __containerof(io, mp_lcd_i2c_bus_obj_t, panel_io_handle);
+static mp_obj_t i2c_readinto(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_self, ARG_buf, ARG_cmd };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_self, MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_buf,  MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_cmd,  MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
-    mp_lcd_err_t ret = i2c_param_config(self->host, &self->bus_config);
-    if (ret != 0) {
-        mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("%d(i2c_param_config)"), ret);
-    }
+    mp_lcd_i2c_bus_obj_t *self = (mp_lcd_i2c_bus_obj_t *)args[ARG_self].u_obj;
+    mp_obj_array_t *a = (mp_obj_array_t *)args[ARG_buf].u_obj;
 
-    ret = i2c_driver_install(self->host, I2C_MODE_MASTER, 0, 0, 0);
-    if (ret != 0) {
-        mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("%d(i2c_driver_install)"), ret);
-    }
-
-    ret = esp_lcd_new_panel_io_i2c(self->bus_handle , &self->panel_io_config, &io->panel_io);
-
-    if (ret != 0) {
-        mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("%d(esp_lcd_new_panel_io_i2c)"), ret);
-    }
-
-    return ret;
+    if (esp_lcd_panel_io_rx_param(self->panel_io, (int)args[ARG_cmd].u_int, a->items, a->len) != ESP_OK)
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("i2c read failed"));
+    return mp_obj_new_int(0);
 }
+static MP_DEFINE_CONST_FUN_OBJ_KW(i2c_readinto_obj, 2, i2c_readinto);
 
 
-mp_lcd_err_t i2c_get_lane_count(lcd_panel_io_t *io, uint8_t *lane_count) {
-    *lane_count = 1;
-    return LCD_OK;
+static mp_obj_t i2c_is_busy(mp_obj_t self_in) { return mp_const_false; }
+static MP_DEFINE_CONST_FUN_OBJ_1(i2c_is_busy_obj, i2c_is_busy);
+
+static mp_obj_t i2c_pending(mp_obj_t self_in) { return MP_OBJ_NEW_SMALL_INT(0); }
+static MP_DEFINE_CONST_FUN_OBJ_1(i2c_pending_obj, i2c_pending);
+
+static mp_obj_t i2c_lane_count(mp_obj_t self_in) { return MP_OBJ_NEW_SMALL_INT(1); }
+static MP_DEFINE_CONST_FUN_OBJ_1(i2c_lane_count_obj, i2c_lane_count);
+
+static mp_obj_t i2c_wait(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    mp_arg_check_num_mp(n_args, pos_args, 1, 2, MP_OBJ_FUN_ARGS_MAX);
+    return mp_const_true;
 }
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(i2c_wait_obj, 1, 3, i2c_wait);
 
+static mp_obj_t i2c_wait_all(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    mp_arg_check_num_mp(n_args, pos_args, 0, 1, MP_OBJ_FUN_ARGS_MAX);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(i2c_wait_all_obj, 0, 2, i2c_wait_all);
+
+
+static mp_obj_t i2c_deinit(mp_obj_t self_in) {
+    mp_lcd_i2c_bus_obj_t *self = (mp_lcd_i2c_bus_obj_t *)self_in;
+    if (!self->initialized) return mp_const_none;
+    esp_lcd_panel_io_del(self->panel_io);
+    i2c_driver_delete(self->host);
+    self->initialized = false;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(i2c_deinit_obj, i2c_deinit);
+
+
+static const mp_rom_map_elem_t i2c_locals_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_write),      MP_ROM_PTR(&i2c_write_obj) },
+    { MP_ROM_QSTR(MP_QSTR_readinto),   MP_ROM_PTR(&i2c_readinto_obj) },
+    { MP_ROM_QSTR(MP_QSTR_is_busy),    MP_ROM_PTR(&i2c_is_busy_obj) },
+    { MP_ROM_QSTR(MP_QSTR_pending),    MP_ROM_PTR(&i2c_pending_obj) },
+    { MP_ROM_QSTR(MP_QSTR_wait),       MP_ROM_PTR(&i2c_wait_obj) },
+    { MP_ROM_QSTR(MP_QSTR_wait_all),   MP_ROM_PTR(&i2c_wait_all_obj) },
+    { MP_ROM_QSTR(MP_QSTR_lane_count), MP_ROM_PTR(&i2c_lane_count_obj) },
+    { MP_ROM_QSTR(MP_QSTR_deinit),     MP_ROM_PTR(&i2c_deinit_obj) },
+    { MP_ROM_QSTR(MP_QSTR___del__),    MP_ROM_PTR(&i2c_deinit_obj) },
+};
+static MP_DEFINE_CONST_DICT(i2c_locals_dict, i2c_locals_table);
 
 MP_DEFINE_CONST_OBJ_TYPE(
     mp_lcd_i2c_bus_type,
     MP_QSTR_I2CBus,
     MP_TYPE_FLAG_NONE,
-    make_new, mp_lcd_i2c_bus_make_new,
-    locals_dict, (mp_obj_dict_t *)&mp_lcd_bus_locals_dict
+    make_new, i2c_make_new,
+    locals_dict, (mp_obj_dict_t *)&i2c_locals_dict
 );
-
