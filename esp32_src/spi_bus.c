@@ -10,7 +10,10 @@
 #include "esp_rom_gpio.h"
 #include "driver/gpio.h"
 
+#include <stdio.h>
 #include <string.h>
+
+#define ERR_MSG_BUF 64
 
 static spi_device_handle_t  s_spi_device[SOC_SPI_PERIPH_NUM];
 
@@ -36,9 +39,10 @@ static int enqueue(mp_lcd_spi_bus_obj_t *self, const mp_obj_t buf, void *rx) {
 
     self->ref_bufs[idx] = buf;
 
-    if (spi_device_queue_trans(self->handle, &self->trans[idx], 0) != ESP_OK) {
+    esp_err_t ret = spi_device_queue_trans(self->handle, &self->trans[idx], 0);
+    if (ret != ESP_OK) {
         self->ref_bufs[idx] = mp_const_none;
-        return -1;
+        return -((int)ret);
     }
 
     self->queue_tail = (self->queue_tail + 1) % SPI_DMA_QUEUE_DEPTH;
@@ -81,21 +85,45 @@ static void spi_deinit_hardware(mp_lcd_spi_bus_obj_t *self) {
 }
 
 static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
-    enum { ARG_data, ARG_clk, ARG_freq, ARG_host };
+    enum { ARG_data, ARG_clk, ARG_freq, ARG_host, ARG_sck, ARG_mosi, ARG_miso };
     static const mp_arg_t allowed[] = {
-        { MP_QSTR_data, MP_ARG_OBJ | MP_ARG_REQUIRED },
-        { MP_QSTR_clk,  MP_ARG_INT | MP_ARG_REQUIRED },
+        { MP_QSTR_data, MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
+        { MP_QSTR_clk,  MP_ARG_INT, {.u_int = -1} },
         { MP_QSTR_freq, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 40000000} },
         { MP_QSTR_host, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 1} },
+        { MP_QSTR_sck,  MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
+        { MP_QSTR_mosi, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
+        { MP_QSTR_miso, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
+    bool use_data_style = (args[ARG_data].u_obj != MP_OBJ_NULL);
+    char msg[ERR_MSG_BUF];
+
     size_t n;
     mp_obj_t *items;
-    mp_obj_get_array(args[ARG_data].u_obj, &n, &items);
-    if (n < 1 || n > 8) {
-        mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("data pin count must be 1-8"));
+    int clk_pin;
+
+    if (use_data_style) {
+        mp_obj_get_array(args[ARG_data].u_obj, &n, &items);
+        if (n < 1 || n > 8) {
+            mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("data pin count must be 1-8"));
+        }
+        clk_pin = args[ARG_clk].u_int;
+        if (clk_pin == -1) {
+            mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("clk required with data="));
+        }
+    } else {
+        int sck  = args[ARG_sck].u_int;
+        int mosi = args[ARG_mosi].u_int;
+        if (sck == -1 || mosi == -1) {
+            mp_raise_msg(&mp_type_ValueError,
+                MP_ERROR_TEXT("use data+clk or sck+mosi"));
+        }
+        n = 1;
+        items = NULL;
+        clk_pin = sck;
     }
 
     int host = args[ARG_host].u_int;
@@ -114,12 +142,20 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     self->base.type = &mp_lcd_spi_bus_type;
 
     self->lane_count = (int)n;
-    self->clk_pin = args[ARG_clk].u_int;
+    self->clk_pin = clk_pin;
     self->freq    = args[ARG_freq].u_int;
     self->host    = host;
 
-    for (int i = 0; i < 8; i++)
-        self->data_pins[i] = (i < (int)n) ? mp_obj_get_int(items[i]) : -1;
+    int miso_pin = -1;
+    if (use_data_style) {
+        for (int i = 0; i < 8; i++)
+            self->data_pins[i] = (i < (int)n) ? mp_obj_get_int(items[i]) : -1;
+    } else {
+        self->data_pins[0] = args[ARG_mosi].u_int;
+        miso_pin = args[ARG_miso].u_int;
+        self->data_pins[1] = miso_pin;
+        for (int i = 2; i < 8; i++) self->data_pins[i] = -1;
+    }
 
     self->zero_buf = (uint8_t *)heap_caps_calloc(1, 32768, MALLOC_CAP_DMA);
     if (!self->zero_buf) {
@@ -152,16 +188,20 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         .flags = dflags,
     };
 
-    if (spi_bus_initialize(self->host, &bcfg, SPI_DMA_CH_AUTO) != ESP_OK) {
+    esp_err_t ret = spi_bus_initialize(self->host, &bcfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK) {
+        snprintf(msg, sizeof(msg), "spi_bus_initialize err=0x%x", ret);
         heap_caps_free(self->zero_buf);
         m_del_obj(mp_lcd_spi_bus_obj_t, self);
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("spi_bus_initialize"));
+        mp_raise_msg(&mp_type_RuntimeError, msg);
     }
-    if (spi_bus_add_device(self->host, &dcfg, &self->handle) != ESP_OK) {
+    ret = spi_bus_add_device(self->host, &dcfg, &self->handle);
+    if (ret != ESP_OK) {
+        snprintf(msg, sizeof(msg), "spi_bus_add_device err=0x%x", ret);
         heap_caps_free(self->zero_buf);
         spi_bus_free(self->host);
         m_del_obj(mp_lcd_spi_bus_obj_t, self);
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("spi_bus_add_device"));
+        mp_raise_msg(&mp_type_RuntimeError, msg);
     }
 
     memset(self->trans, 0, sizeof(self->trans));
@@ -189,7 +229,11 @@ static mp_obj_t spi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
 
     int tid = enqueue(self, args[ARG_buf].u_obj, NULL);
-    if (tid < 0) mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue failed"));
+    if (tid < 0) {
+        char msg[ERR_MSG_BUF];
+        snprintf(msg, sizeof(msg), "queue failed err=0x%x", -tid);
+        mp_raise_msg(&mp_type_RuntimeError, msg);
+    }
     return mp_obj_new_int(tid);
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(spi_write_obj, 2, spi_write);
@@ -222,9 +266,12 @@ static mp_obj_t spi_readinto(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
     self->trans[idx].user      = (void *)(uintptr_t)(idx + 1);
     self->ref_bufs[idx] = args[ARG_buf].u_obj;
 
-    if (spi_device_queue_trans(self->handle, &self->trans[idx], 0) != ESP_OK) {
+    esp_err_t ret = spi_device_queue_trans(self->handle, &self->trans[idx], 0);
+    if (ret != ESP_OK) {
         self->ref_bufs[idx] = mp_const_none;
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("readinto queue failed"));
+        char msg[ERR_MSG_BUF];
+        snprintf(msg, sizeof(msg), "readinto queue failed err=0x%x", ret);
+        mp_raise_msg(&mp_type_RuntimeError, msg);
     }
     self->queue_tail = (self->queue_tail + 1) % SPI_DMA_QUEUE_DEPTH;
     self->queue_count++;
@@ -260,9 +307,12 @@ static mp_obj_t spi_write_readinto(size_t n_args, const mp_obj_t *pos_args, mp_m
     self->trans[idx].user      = (void *)(uintptr_t)(idx + 1);
     self->ref_bufs[idx] = args[ARG_rbuf].u_obj;
 
-    if (spi_device_queue_trans(self->handle, &self->trans[idx], 0) != ESP_OK) {
+    esp_err_t ret = spi_device_queue_trans(self->handle, &self->trans[idx], 0);
+    if (ret != ESP_OK) {
         self->ref_bufs[idx] = mp_const_none;
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("write_readinto queue failed"));
+        char msg[ERR_MSG_BUF];
+        snprintf(msg, sizeof(msg), "write_readinto queue failed err=0x%x", ret);
+        mp_raise_msg(&mp_type_RuntimeError, msg);
     }
     self->queue_tail = (self->queue_tail + 1) % SPI_DMA_QUEUE_DEPTH;
     self->queue_count++;

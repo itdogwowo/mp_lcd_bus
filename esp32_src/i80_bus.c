@@ -15,6 +15,7 @@
 #include "esp_rom_gpio.h"
 #include "driver/gpio.h"
 
+#include <stdio.h>
 #include <string.h>
 
 static esp_lcd_i80_bus_handle_t  s_last_i80_bus = NULL;
@@ -77,9 +78,12 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     if (s_last_i80_panel_io) { esp_lcd_panel_io_del(s_last_i80_panel_io); s_last_i80_panel_io = NULL; }
     if (s_last_i80_bus)      { esp_lcd_del_i80_bus(s_last_i80_bus);        s_last_i80_bus = NULL; }
 
-    if (esp_lcd_new_i80_bus(&bcfg, &self->bus_handle) != ESP_OK) {
+    esp_err_t ret = esp_lcd_new_i80_bus(&bcfg, &self->bus_handle);
+    if (ret != ESP_OK) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "esp_lcd_new_i80_bus err=0x%x", ret);
         m_del_obj(mp_lcd_i80_bus_obj_t, self);
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("esp_lcd_new_i80_bus"));
+        mp_raise_msg(&mp_type_RuntimeError, msg);
     }
 
     esp_lcd_panel_io_i80_config_t iocfg = {
@@ -93,10 +97,13 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         .dc_levels = { .dc_idle_level = 0, .dc_cmd_level = 0, .dc_dummy_level = 0, .dc_data_level = 1 },
     };
 
-    if (esp_lcd_new_panel_io_i80(self->bus_handle, &iocfg, &self->panel_io) != ESP_OK) {
+    esp_err_t ret2 = esp_lcd_new_panel_io_i80(self->bus_handle, &iocfg, &self->panel_io);
+    if (ret2 != ESP_OK) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "esp_lcd_new_panel_io_i80 err=0x%x", ret2);
         esp_lcd_del_i80_bus(self->bus_handle);
         m_del_obj(mp_lcd_i80_bus_obj_t, self);
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("esp_lcd_new_panel_io_i80"));
+        mp_raise_msg(&mp_type_RuntimeError, msg);
     }
 
     memset(self->ref_bufs, 0, sizeof(self->ref_bufs));

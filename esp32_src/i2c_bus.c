@@ -5,6 +5,10 @@
 #include "esp_rom_gpio.h"
 #include "driver/gpio.h"
 
+#include <stdio.h>
+
+#define ERR_MSG_BUF 64
+
 static esp_lcd_panel_io_handle_t s_i2c_panel_io;
 
 static mp_obj_t i2c_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
@@ -38,13 +42,19 @@ static mp_obj_t i2c_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
 
     if (s_i2c_panel_io) { esp_lcd_panel_io_del(s_i2c_panel_io); s_i2c_panel_io = NULL; }
     i2c_driver_delete(self->host);
-    if (i2c_param_config(self->host, &self->bus_config) != ESP_OK) {
+
+    char msg[ERR_MSG_BUF];
+    esp_err_t ret = i2c_param_config(self->host, &self->bus_config);
+    if (ret != ESP_OK) {
+        snprintf(msg, sizeof(msg), "i2c_param_config err=0x%x", ret);
         m_del_obj(mp_lcd_i2c_bus_obj_t, self);
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("i2c_param_config"));
+        mp_raise_msg(&mp_type_RuntimeError, msg);
     }
-    if (i2c_driver_install(self->host, I2C_MODE_MASTER, 0, 0, 0) != ESP_OK) {
+    ret = i2c_driver_install(self->host, I2C_MODE_MASTER, 0, 0, 0);
+    if (ret != ESP_OK) {
+        snprintf(msg, sizeof(msg), "i2c_driver_install err=0x%x", ret);
         m_del_obj(mp_lcd_i2c_bus_obj_t, self);
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("i2c_driver_install"));
+        mp_raise_msg(&mp_type_RuntimeError, msg);
     }
 
     esp_lcd_panel_io_i2c_config_t iocfg = {
@@ -56,10 +66,12 @@ static mp_obj_t i2c_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         .flags = { .dc_low_on_data = false, .disable_control_phase = false },
     };
 
-    if (esp_lcd_new_panel_io_i2c(self->bus_handle, &iocfg, &self->panel_io) != ESP_OK) {
+    ret = esp_lcd_new_panel_io_i2c(self->bus_handle, &iocfg, &self->panel_io);
+    if (ret != ESP_OK) {
+        snprintf(msg, sizeof(msg), "esp_lcd_new_panel_io_i2c err=0x%x", ret);
         i2c_driver_delete(self->host);
         m_del_obj(mp_lcd_i2c_bus_obj_t, self);
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("esp_lcd_new_panel_io_i2c"));
+        mp_raise_msg(&mp_type_RuntimeError, msg);
     }
 
     s_i2c_panel_io = self->panel_io;
@@ -80,8 +92,12 @@ static mp_obj_t i2c_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     mp_lcd_i2c_bus_obj_t *self = (mp_lcd_i2c_bus_obj_t *)args[ARG_self].u_obj;
     mp_obj_array_t *a = (mp_obj_array_t *)args[ARG_buf].u_obj;
 
-    if (esp_lcd_panel_io_tx_color(self->panel_io, -1, a->items, a->len) != ESP_OK)
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("i2c write failed"));
+    esp_err_t ret = esp_lcd_panel_io_tx_color(self->panel_io, -1, a->items, a->len);
+    if (ret != ESP_OK) {
+        char msg[ERR_MSG_BUF];
+        snprintf(msg, sizeof(msg), "i2c write failed err=0x%x", ret);
+        mp_raise_msg(&mp_type_RuntimeError, msg);
+    }
     return mp_obj_new_int(0);
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(i2c_write_obj, 2, i2c_write);
@@ -100,8 +116,12 @@ static mp_obj_t i2c_readinto(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
     mp_lcd_i2c_bus_obj_t *self = (mp_lcd_i2c_bus_obj_t *)args[ARG_self].u_obj;
     mp_obj_array_t *a = (mp_obj_array_t *)args[ARG_buf].u_obj;
 
-    if (esp_lcd_panel_io_rx_param(self->panel_io, (int)args[ARG_cmd].u_int, a->items, a->len) != ESP_OK)
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("i2c read failed"));
+    esp_err_t ret = esp_lcd_panel_io_rx_param(self->panel_io, (int)args[ARG_cmd].u_int, a->items, a->len);
+    if (ret != ESP_OK) {
+        char msg[ERR_MSG_BUF];
+        snprintf(msg, sizeof(msg), "i2c read failed err=0x%x", ret);
+        mp_raise_msg(&mp_type_RuntimeError, msg);
+    }
     return mp_obj_new_int(0);
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(i2c_readinto_obj, 2, i2c_readinto);

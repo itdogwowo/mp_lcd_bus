@@ -14,6 +14,7 @@
 #include "esp_rom_gpio.h"
 #include "driver/gpio.h"
 
+#include <stdio.h>
 #include <string.h>
 
 static esp_lcd_panel_handle_t s_last_rgb_panel = NULL;
@@ -135,9 +136,12 @@ static mp_obj_t rgb_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
 
     if (s_last_rgb_panel) { esp_lcd_panel_del(s_last_rgb_panel); s_last_rgb_panel = NULL; }
 
-    if (esp_lcd_new_rgb_panel(&pc, &self->panel_handle) != ESP_OK) {
+    esp_err_t ret = esp_lcd_new_rgb_panel(&pc, &self->panel_handle);
+    if (ret != ESP_OK) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "esp_lcd_new_rgb_panel err=0x%x", ret);
         m_del_obj(mp_lcd_rgb_bus_obj_t, self);
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("esp_lcd_new_rgb_panel"));
+        mp_raise_msg(&mp_type_RuntimeError, msg);
     }
 
     esp_lcd_rgb_panel_event_callbacks_t cbs = { .on_vsync = on_vsync };
