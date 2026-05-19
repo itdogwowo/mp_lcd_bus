@@ -13,6 +13,8 @@
 
 #include <string.h>
 
+static esp_lcd_panel_handle_t s_last_rgb_panel = NULL;
+
 static bool on_vsync(esp_lcd_panel_handle_t panel,
                      const esp_lcd_rgb_panel_event_data_t *edata, void *ctx) {
     mp_lcd_rgb_bus_obj_t *self = (mp_lcd_rgb_bus_obj_t *)ctx;
@@ -128,6 +130,8 @@ static mp_obj_t rgb_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     };
     for (int i = 0; i < 16; i++) pc.data_gpio_nums[i] = self->data_pins[i];
 
+    if (s_last_rgb_panel) { esp_lcd_panel_del(s_last_rgb_panel); s_last_rgb_panel = NULL; }
+
     if (esp_lcd_new_rgb_panel(&pc, &self->panel_handle) != ESP_OK) {
         m_del_obj(mp_lcd_rgb_bus_obj_t, self);
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("esp_lcd_new_rgb_panel"));
@@ -154,6 +158,8 @@ static mp_obj_t rgb_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     memset(self->done_flags, 0, sizeof(self->done_flags));
     self->queue_head = self->queue_tail = self->queue_count = 0;
     self->initialized = true;
+
+    s_last_rgb_panel = self->panel_handle;
 
     return MP_OBJ_FROM_PTR(self);
 }
@@ -269,6 +275,7 @@ static MP_DEFINE_CONST_FUN_OBJ_KW(rgb_wait_all_obj, 1, rgb_wait_all);
 static mp_obj_t rgb_deinit(mp_obj_t self_in) {
     mp_lcd_rgb_bus_obj_t *self = (mp_lcd_rgb_bus_obj_t *)self_in;
     if (!self->initialized) return mp_const_none;
+    if (s_last_rgb_panel == self->panel_handle) s_last_rgb_panel = NULL;
     esp_lcd_panel_del(self->panel_handle);
     self->initialized = false;
     return mp_const_none;

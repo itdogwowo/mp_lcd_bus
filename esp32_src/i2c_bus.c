@@ -31,6 +31,7 @@ static mp_obj_t i2c_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     self->bus_config.clk_flags = I2C_SCLK_SRC_FLAG_FOR_NOMAL;
     self->bus_handle = (esp_lcd_i2c_bus_handle_t)((uint32_t)self->host);
 
+    i2c_driver_delete(self->host);
     if (i2c_param_config(self->host, &self->bus_config) != ESP_OK) {
         m_del_obj(mp_lcd_i2c_bus_obj_t, self);
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("i2c_param_config"));

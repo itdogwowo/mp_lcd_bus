@@ -13,6 +13,10 @@
 #include "py/gc.h"
 
 #include <string.h>
+
+static esp_lcd_i80_bus_handle_t  s_last_i80_bus = NULL;
+static esp_lcd_panel_io_handle_t s_last_i80_panel_io = NULL;
+
 static bool on_color_done(esp_lcd_panel_io_handle_t panel_io,
                           esp_lcd_panel_io_event_data_t *edata, void *ctx) {
     mp_lcd_i80_bus_obj_t *self = (mp_lcd_i80_bus_obj_t *)ctx;
@@ -67,6 +71,9 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     };
     for (int i = 0; i < 16; i++) bcfg.data_gpio_nums[i] = self->data_pins[i];
 
+    if (s_last_i80_panel_io) { esp_lcd_panel_io_del(s_last_i80_panel_io); s_last_i80_panel_io = NULL; }
+    if (s_last_i80_bus)      { esp_lcd_del_i80_bus(s_last_i80_bus);        s_last_i80_bus = NULL; }
+
     if (esp_lcd_new_i80_bus(&bcfg, &self->bus_handle) != ESP_OK) {
         m_del_obj(mp_lcd_i80_bus_obj_t, self);
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("esp_lcd_new_i80_bus"));
@@ -93,6 +100,9 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     memset(self->done_flags, 0, sizeof(self->done_flags));
     self->queue_head = self->queue_tail = self->queue_count = 0;
     self->initialized = true;
+
+    s_last_i80_bus = self->bus_handle;
+    s_last_i80_panel_io = self->panel_io;
 
     return MP_OBJ_FROM_PTR(self);
 }
@@ -199,6 +209,8 @@ static MP_DEFINE_CONST_FUN_OBJ_KW(i80_wait_all_obj, 1, i80_wait_all);
 static mp_obj_t i80_deinit(mp_obj_t self_in) {
     mp_lcd_i80_bus_obj_t *self = (mp_lcd_i80_bus_obj_t *)self_in;
     if (!self->initialized) return mp_const_none;
+    if (s_last_i80_panel_io == self->panel_io) s_last_i80_panel_io = NULL;
+    if (s_last_i80_bus == self->bus_handle)   s_last_i80_bus = NULL;
     esp_lcd_panel_io_del(self->panel_io);
     esp_lcd_del_i80_bus(self->bus_handle);
     self->initialized = false;

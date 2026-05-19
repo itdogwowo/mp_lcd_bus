@@ -5,6 +5,7 @@
 #include "py/mphal.h"
 #include "py/gc.h"
 #include "esp_heap_caps.h"
+#include "soc/soc_caps.h"
 
 #include <string.h>
 
@@ -47,7 +48,7 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         { MP_QSTR_data, MP_ARG_OBJ | MP_ARG_REQUIRED },
         { MP_QSTR_clk,  MP_ARG_INT | MP_ARG_REQUIRED },
         { MP_QSTR_freq, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 40000000} },
-        { MP_QSTR_host, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = SPI2_HOST} },
+        { MP_QSTR_host, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 1} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed), allowed, args);
@@ -59,13 +60,19 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("data pin count must be 1-8"));
     }
 
+    int host = args[ARG_host].u_int;
+    if (host < 1 || host >= SOC_SPI_PERIPH_NUM) {
+        mp_raise_msg_varg(&mp_type_ValueError,
+            MP_ERROR_TEXT("host=%d not available (valid: 1..%d)"), host, SOC_SPI_PERIPH_NUM - 1);
+    }
+
     mp_lcd_spi_bus_obj_t *self = m_new_obj(mp_lcd_spi_bus_obj_t);
     self->base.type = &mp_lcd_spi_bus_type;
 
     self->lane_count = (int)n;
     self->clk_pin = args[ARG_clk].u_int;
     self->freq    = args[ARG_freq].u_int;
-    self->host    = args[ARG_host].u_int;
+    self->host    = host;
 
     for (int i = 0; i < 8; i++)
         self->data_pins[i] = (i < (int)n) ? mp_obj_get_int(items[i]) : -1;
@@ -101,6 +108,7 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         .flags = dflags,
     };
 
+    spi_bus_free(self->host);
     if (spi_bus_initialize(self->host, &bcfg, SPI_DMA_CH_AUTO) != ESP_OK) {
         heap_caps_free(self->zero_buf);
         m_del_obj(mp_lcd_spi_bus_obj_t, self);
