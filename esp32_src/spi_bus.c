@@ -6,6 +6,9 @@
 #include "py/gc.h"
 #include "esp_heap_caps.h"
 #include "soc/soc_caps.h"
+#include "soc/gpio_sig_map.h"
+#include "esp_rom_gpio.h"
+#include "driver/gpio.h"
 
 #include <string.h>
 
@@ -60,6 +63,19 @@ static void spi_deinit_hardware(mp_lcd_spi_bus_obj_t *self) {
     spi_bus_remove_device(self->handle);
     spi_bus_free(self->host);
     if (self->host < SOC_SPI_PERIPH_NUM) s_spi_device[self->host] = NULL;
+
+    int8_t pins[9];
+    int p = 0;
+    pins[p++] = self->clk_pin;
+    for (int i = 0; i < self->lane_count; i++) {
+        if (self->data_pins[i] != -1) pins[p++] = self->data_pins[i];
+    }
+    for (int i = 0; i < p; i++) {
+        esp_rom_gpio_pad_select_gpio(pins[i]);
+        esp_rom_gpio_connect_out_signal(pins[i], SIG_GPIO_OUT_IDX, false, false);
+        gpio_set_direction(pins[i], GPIO_MODE_INPUT);
+    }
+
     if (self->zero_buf) { heap_caps_free(self->zero_buf); self->zero_buf = NULL; }
     self->initialized = false;
 }

@@ -10,6 +10,9 @@
 #include "py/objarray.h"
 #include "py/mphal.h"
 #include "py/gc.h"
+#include "soc/gpio_sig_map.h"
+#include "esp_rom_gpio.h"
+#include "driver/gpio.h"
 
 #include <string.h>
 
@@ -277,6 +280,23 @@ static mp_obj_t rgb_deinit(mp_obj_t self_in) {
     if (!self->initialized) return mp_const_none;
     if (s_last_rgb_panel == self->panel_handle) s_last_rgb_panel = NULL;
     esp_lcd_panel_del(self->panel_handle);
+
+    int8_t pins[21];
+    int p = 0;
+    pins[p++] = self->hsync_pin;
+    pins[p++] = self->vsync_pin;
+    pins[p++] = self->de_pin;
+    pins[p++] = self->pclk_pin;
+    if (self->disp_pin != -1) pins[p++] = self->disp_pin;
+    for (int i = 0; i < self->lane_count; i++) {
+        if (self->data_pins[i] != -1) pins[p++] = self->data_pins[i];
+    }
+    for (int i = 0; i < p; i++) {
+        esp_rom_gpio_pad_select_gpio(pins[i]);
+        esp_rom_gpio_connect_out_signal(pins[i], SIG_GPIO_OUT_IDX, false, false);
+        gpio_set_direction(pins[i], GPIO_MODE_INPUT);
+    }
+
     self->initialized = false;
     return mp_const_none;
 }

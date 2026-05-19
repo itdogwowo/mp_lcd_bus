@@ -1,6 +1,9 @@
 #include "i2c_bus.h"
 #include "py/runtime.h"
 #include "py/objarray.h"
+#include "soc/gpio_sig_map.h"
+#include "esp_rom_gpio.h"
+#include "driver/gpio.h"
 
 static esp_lcd_panel_io_handle_t s_i2c_panel_io;
 
@@ -130,6 +133,14 @@ static mp_obj_t i2c_deinit(mp_obj_t self_in) {
     if (s_i2c_panel_io == self->panel_io) s_i2c_panel_io = NULL;
     esp_lcd_panel_io_del(self->panel_io);
     i2c_driver_delete(self->host);
+
+    int8_t pins[2] = {self->sda_pin, self->scl_pin};
+    for (int i = 0; i < 2; i++) {
+        esp_rom_gpio_pad_select_gpio(pins[i]);
+        esp_rom_gpio_connect_out_signal(pins[i], SIG_GPIO_OUT_IDX, false, false);
+        gpio_set_direction(pins[i], GPIO_MODE_INPUT);
+    }
+
     self->initialized = false;
     return mp_const_none;
 }

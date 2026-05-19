@@ -11,6 +11,9 @@
 #include "py/objarray.h"
 #include "py/mphal.h"
 #include "py/gc.h"
+#include "soc/gpio_sig_map.h"
+#include "esp_rom_gpio.h"
+#include "driver/gpio.h"
 
 #include <string.h>
 
@@ -213,6 +216,20 @@ static mp_obj_t i80_deinit(mp_obj_t self_in) {
     if (s_last_i80_bus == self->bus_handle)   s_last_i80_bus = NULL;
     esp_lcd_panel_io_del(self->panel_io);
     esp_lcd_del_i80_bus(self->bus_handle);
+
+    int8_t pins[18];
+    int p = 0;
+    pins[p++] = self->wr_pin;
+    if (self->cs_pin != -1) pins[p++] = self->cs_pin;
+    for (int i = 0; i < self->lane_count; i++) {
+        if (self->data_pins[i] != -1) pins[p++] = self->data_pins[i];
+    }
+    for (int i = 0; i < p; i++) {
+        esp_rom_gpio_pad_select_gpio(pins[i]);
+        esp_rom_gpio_connect_out_signal(pins[i], SIG_GPIO_OUT_IDX, false, false);
+        gpio_set_direction(pins[i], GPIO_MODE_INPUT);
+    }
+
     self->initialized = false;
     return mp_const_none;
 }
