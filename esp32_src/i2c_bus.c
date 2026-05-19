@@ -108,14 +108,12 @@ static MP_DEFINE_CONST_FUN_OBJ_1(i2c_pending_obj, i2c_pending);
 static mp_obj_t i2c_lane_count(mp_obj_t self_in) { return MP_OBJ_NEW_SMALL_INT(1); }
 static MP_DEFINE_CONST_FUN_OBJ_1(i2c_lane_count_obj, i2c_lane_count);
 
-static mp_obj_t i2c_wait(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
-    mp_arg_check_num_mp(n_args, pos_args, 1, 2, MP_OBJ_FUN_ARGS_MAX);
+static mp_obj_t i2c_wait(size_t n_args, const mp_obj_t *pos_args) {
     return mp_const_true;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(i2c_wait_obj, 1, 3, i2c_wait);
 
-static mp_obj_t i2c_wait_all(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
-    mp_arg_check_num_mp(n_args, pos_args, 0, 1, MP_OBJ_FUN_ARGS_MAX);
+static mp_obj_t i2c_wait_all(size_t n_args, const mp_obj_t *pos_args) {
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(i2c_wait_all_obj, 0, 2, i2c_wait_all);
