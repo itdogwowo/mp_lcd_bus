@@ -147,7 +147,7 @@ def test_speed():
 
 def test_i2c():
     hdr("I2C 功能測試")
-    bus = lcd_bus.I2CBus(data=(21,), clk=22, addr=0x3C)
+    bus = lcd_bus.I2CBus(sda=21, scl=22, addr=0x3C)
     ok(f"lane_count = {bus.lane_count}")
     bus.write(b'\x00\xAE')
     ok("write 完成")

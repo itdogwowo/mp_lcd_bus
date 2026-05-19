@@ -3,26 +3,21 @@
 #include "py/objarray.h"
 
 static mp_obj_t i2c_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
-    enum { ARG_data, ARG_clk, ARG_addr, ARG_freq };
+    enum { ARG_sda, ARG_scl, ARG_addr, ARG_freq };
     static const mp_arg_t allowed[] = {
-        { MP_QSTR_data, MP_ARG_OBJ | MP_ARG_REQUIRED },
-        { MP_QSTR_clk,  MP_ARG_INT | MP_ARG_REQUIRED },
+        { MP_QSTR_sda,  MP_ARG_INT | MP_ARG_REQUIRED },
+        { MP_QSTR_scl,  MP_ARG_INT | MP_ARG_REQUIRED },
         { MP_QSTR_addr, MP_ARG_INT | MP_ARG_REQUIRED },
-        { MP_QSTR_freq, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 10000000} },
+        { MP_QSTR_freq, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 400000} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
-    size_t n;
-    mp_obj_t *items;
-    mp_obj_get_array(args[ARG_data].u_obj, &n, &items);
-    if (n != 1) mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("I2C data expects 1 pin (sda)"));
-
     mp_lcd_i2c_bus_obj_t *self = m_new_obj(mp_lcd_i2c_bus_obj_t);
     self->base.type = &mp_lcd_i2c_bus_type;
 
-    self->sda_pin = mp_obj_get_int(items[0]);
-    self->scl_pin = args[ARG_clk].u_int;
+    self->sda_pin = args[ARG_sda].u_int;
+    self->scl_pin = args[ARG_scl].u_int;
     self->addr    = args[ARG_addr].u_int;
     self->freq    = args[ARG_freq].u_int;
     self->host    = 0;
