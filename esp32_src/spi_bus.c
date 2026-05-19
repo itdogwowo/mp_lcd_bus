@@ -9,6 +9,8 @@
 
 #include <string.h>
 
+static spi_device_handle_t  s_spi_device[SOC_SPI_PERIPH_NUM];
+
 static uint32_t lane_flag(int n) {
     switch (n) {
         case 2:  return SPI_TRANS_MODE_DIO;
@@ -41,6 +43,26 @@ static int enqueue(mp_lcd_spi_bus_obj_t *self, const mp_obj_t buf, void *rx) {
     return idx + 1;
 }
 
+static void spi_drain_pending(mp_lcd_spi_bus_obj_t *self) {
+    while (self->queue_count > 0) {
+        spi_transaction_t *rt;
+        if (spi_device_get_trans_result(self->handle, &rt, 0) != ESP_OK) break;
+        int done = (int)(uintptr_t)rt->user - 1;
+        if (done >= 0 && done < SPI_DMA_QUEUE_DEPTH) {
+            self->ref_bufs[done] = mp_const_none;
+            self->queue_count--;
+        }
+    }
+}
+
+static void spi_deinit_hardware(mp_lcd_spi_bus_obj_t *self) {
+    if (!self->initialized) return;
+    spi_bus_remove_device(self->handle);
+    spi_bus_free(self->host);
+    if (self->host < SOC_SPI_PERIPH_NUM) s_spi_device[self->host] = NULL;
+    if (self->zero_buf) { heap_caps_free(self->zero_buf); self->zero_buf = NULL; }
+    self->initialized = false;
+}
 
 static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
     enum { ARG_data, ARG_clk, ARG_freq, ARG_host };
@@ -65,6 +87,12 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         mp_raise_msg_varg(&mp_type_ValueError,
             MP_ERROR_TEXT("host=%d not available (valid: 1..%d)"), host, SOC_SPI_PERIPH_NUM - 1);
     }
+
+    if (s_spi_device[host]) {
+        spi_bus_remove_device(s_spi_device[host]);
+        s_spi_device[host] = NULL;
+    }
+    spi_bus_free(host);
 
     mp_lcd_spi_bus_obj_t *self = m_new_obj(mp_lcd_spi_bus_obj_t);
     self->base.type = &mp_lcd_spi_bus_type;
@@ -108,7 +136,6 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         .flags = dflags,
     };
 
-    spi_bus_free(self->host);
     if (spi_bus_initialize(self->host, &bcfg, SPI_DMA_CH_AUTO) != ESP_OK) {
         heap_caps_free(self->zero_buf);
         m_del_obj(mp_lcd_spi_bus_obj_t, self);
@@ -125,6 +152,8 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     memset(self->ref_bufs, 0, sizeof(self->ref_bufs));
     self->queue_head = self->queue_tail = self->queue_count = 0;
     self->initialized = true;
+
+    s_spi_device[host] = self->handle;
 
     return MP_OBJ_FROM_PTR(self);
 }
@@ -262,14 +291,16 @@ static mp_obj_t spi_wait(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_a
     if (self->ref_bufs[idx] == mp_const_none) return mp_const_true;
 
     TickType_t tt = (to < 0) ? portMAX_DELAY : pdMS_TO_TICKS(to);
-    spi_transaction_t *rt;
-    if (spi_device_get_trans_result(self->handle, &rt, tt) != ESP_OK)
-        return mp_const_false;
-
-    int done = (int)(uintptr_t)rt->user - 1;
-    self->ref_bufs[done] = mp_const_none;
-    self->queue_head = (self->queue_head + 1) % SPI_DMA_QUEUE_DEPTH;
-    self->queue_count--;
+    while (self->ref_bufs[idx] != mp_const_none) {
+        spi_transaction_t *rt;
+        if (spi_device_get_trans_result(self->handle, &rt, tt) != ESP_OK)
+            return mp_const_false;
+        int done = (int)(uintptr_t)rt->user - 1;
+        if (done >= 0 && done < SPI_DMA_QUEUE_DEPTH) {
+            self->ref_bufs[done] = mp_const_none;
+            self->queue_count--;
+        }
+    }
     return mp_const_true;
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(spi_wait_obj, 2, spi_wait);
@@ -292,9 +323,10 @@ static mp_obj_t spi_wait_all(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
         spi_transaction_t *rt;
         if (spi_device_get_trans_result(self->handle, &rt, tt) != ESP_OK) break;
         int done = (int)(uintptr_t)rt->user - 1;
-        self->ref_bufs[done] = mp_const_none;
-        self->queue_head = (self->queue_head + 1) % SPI_DMA_QUEUE_DEPTH;
-        self->queue_count--;
+        if (done >= 0 && done < SPI_DMA_QUEUE_DEPTH) {
+            self->ref_bufs[done] = mp_const_none;
+            self->queue_count--;
+        }
     }
     gc_collect();
     return mp_const_none;
@@ -304,11 +336,8 @@ static MP_DEFINE_CONST_FUN_OBJ_KW(spi_wait_all_obj, 1, spi_wait_all);
 
 static mp_obj_t spi_deinit(mp_obj_t self_in) {
     mp_lcd_spi_bus_obj_t *self = (mp_lcd_spi_bus_obj_t *)self_in;
-    if (!self->initialized) return mp_const_none;
-    spi_bus_remove_device(self->handle);
-    spi_bus_free(self->host);
-    if (self->zero_buf) { heap_caps_free(self->zero_buf); self->zero_buf = NULL; }
-    self->initialized = false;
+    spi_drain_pending(self);
+    spi_deinit_hardware(self);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(spi_deinit_obj, spi_deinit);

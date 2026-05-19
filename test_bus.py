@@ -86,6 +86,7 @@ def test_spi():
     buf = bytearray(256)
     tid = bus.write(buf)
     ok(f"write -> trans_id={tid}, pending={bus.pending()}")
+    bus.wait(tid)
 
     sec("排隊 4 個")
     tids = []

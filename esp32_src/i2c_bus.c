@@ -2,6 +2,8 @@
 #include "py/runtime.h"
 #include "py/objarray.h"
 
+static esp_lcd_panel_io_handle_t s_i2c_panel_io;
+
 static mp_obj_t i2c_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
     enum { ARG_sda, ARG_scl, ARG_addr, ARG_freq };
     static const mp_arg_t allowed[] = {
@@ -31,6 +33,7 @@ static mp_obj_t i2c_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     self->bus_config.clk_flags = I2C_SCLK_SRC_FLAG_FOR_NOMAL;
     self->bus_handle = (esp_lcd_i2c_bus_handle_t)((uint32_t)self->host);
 
+    if (s_i2c_panel_io) { esp_lcd_panel_io_del(s_i2c_panel_io); s_i2c_panel_io = NULL; }
     i2c_driver_delete(self->host);
     if (i2c_param_config(self->host, &self->bus_config) != ESP_OK) {
         m_del_obj(mp_lcd_i2c_bus_obj_t, self);
@@ -56,6 +59,7 @@ static mp_obj_t i2c_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("esp_lcd_new_panel_io_i2c"));
     }
 
+    s_i2c_panel_io = self->panel_io;
     self->initialized = true;
     return MP_OBJ_FROM_PTR(self);
 }
@@ -123,6 +127,7 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(i2c_wait_all_obj, 0, 2, i2c_wait_all)
 static mp_obj_t i2c_deinit(mp_obj_t self_in) {
     mp_lcd_i2c_bus_obj_t *self = (mp_lcd_i2c_bus_obj_t *)self_in;
     if (!self->initialized) return mp_const_none;
+    if (s_i2c_panel_io == self->panel_io) s_i2c_panel_io = NULL;
     esp_lcd_panel_io_del(self->panel_io);
     i2c_driver_delete(self->host);
     self->initialized = false;
