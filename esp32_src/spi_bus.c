@@ -212,15 +212,43 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
 
 
 static mp_obj_t spi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
-    enum { ARG_self, ARG_buf };
+    enum { ARG_self, ARG_buf, ARG_cmd, ARG_addr, ARG_multiline };
     static const mp_arg_t allowed[] = {
-        { MP_QSTR_self, MP_ARG_OBJ | MP_ARG_REQUIRED },
-        { MP_QSTR_buf,  MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_self,      MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_buf,       MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_cmd,       MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
+        { MP_QSTR_addr,      MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
+        { MP_QSTR_multiline, MP_ARG_BOOL | MP_ARG_KW_ONLY, {.u_bool = true} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
     mp_lcd_spi_bus_obj_t *self = (mp_lcd_spi_bus_obj_t *)args[ARG_self].u_obj;
+
+    if (args[ARG_cmd].u_int >= 0) {
+        spi_drain_pending(self);
+
+        spi_transaction_ext_t t;
+        memset(&t, 0, sizeof(t));
+        uint32_t flags = lane_flag(self->lane_count);
+        if (args[ARG_multiline].u_bool) {
+            flags |= SPI_TRANS_MULTILINE_CMD | SPI_TRANS_MULTILINE_ADDR;
+        }
+        t.base.flags = flags;
+        t.command_bits = 8;
+        t.address_bits = 24;
+        t.base.cmd  = (uint16_t)args[ARG_cmd].u_int;
+        t.base.addr = (uint32_t)args[ARG_addr].u_int;
+
+        mp_buffer_info_t bufinfo;
+        mp_get_buffer_raise(args[ARG_buf].u_obj, &bufinfo, MP_BUFFER_READ);
+        t.base.tx_buffer = bufinfo.buf;
+        t.base.length    = bufinfo.len * 8;
+
+        spi_device_polling_transmit(self->handle, (spi_transaction_t *)&t);
+        return mp_const_none;
+    }
+
     if (self->queue_count >= SPI_DMA_QUEUE_DEPTH)
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
 
