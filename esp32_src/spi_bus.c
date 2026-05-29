@@ -155,6 +155,10 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
 
     self->zero_buf = (uint8_t *)heap_caps_calloc(1, 32768, MALLOC_CAP_DMA);
     if (!self->zero_buf) {
+        gc_collect();
+        self->zero_buf = (uint8_t *)heap_caps_calloc(1, 32768, MALLOC_CAP_DMA);
+    }
+    if (!self->zero_buf) {
         m_del_obj(mp_lcd_spi_bus_obj_t, self);
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DMA zero buffer alloc failed"));
     }
