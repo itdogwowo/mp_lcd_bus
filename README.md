@@ -24,21 +24,15 @@ All buses expose the same methods:
 | Method | SPI | I2C | I80 | RGB |
 |---|---|---|---|---|
 | `write(buf)` → `trans_id` | ✅ async | ✅ | ✅ async | ✅ async |
+| `write(buf, *, cmd=, addr=, multiline=)` → `None` | ✅ sync | ❌ | ❌ | ❌ |
 | `readinto(buf, write_val=0)` → `trans_id` | ✅ async | ✅ | ❌ | ❌ |
 | `write_readinto(wbuf, rbuf)` → `trans_id` | ✅ async | ❌ | ❌ | ❌ |
 | `is_busy()` → `bool` | ✅ | ✅ | ✅ | ✅ |
 | `pending()` → `int` | ✅ | ✅ | ✅ | ✅ |
-| `wait(trans_id, timeout_ms=-1)` | ✅ | ✅ | ✅ | ✅ |
-| `wait_all(timeout_ms=-1)` | ✅ | ✅ | ✅ | ✅ |
-| `lane_count` (property) | ✅ | ✅ | ✅ | ✅ |
+| `wait(trans_id, timeout_ms=-1)` → `bool` | ✅ | ✅ | ✅ | ✅ |
+| `wait_all(timeout_ms=-1)` → `None` | ✅ | ✅ | ✅ | ✅ |
+| `lane_count()` → `int` | ✅ | ✅ | ✅ | ✅ |
 | `deinit()` | ✅ | ✅ | ✅ | ✅ |
-
-## Design Principles
-
-- **DC/CS not managed by bus** — upper panel driver is responsible
-- **Auto-detect lane count from `data` tuple** — no mode flags needed
-- **write / readinto / write_readinto all async** — return `trans_id`, check with `wait()`
-- **GC-safe** — `ref_bufs[]` holds buffer reference, released on `wait()`
 
 ## Constructors
 
@@ -54,7 +48,7 @@ lcd_bus.SPIBus(data, clk, *, freq=40_000_000, host=1)
 |---|---|
 | 1 | Standard SPI |
 | 2 | Dual SPI |
-| 4 | Quad SPI |
+| 4 | Quad SPI (QSPI) |
 | 8 | Octal SPI |
 
 ```python
@@ -100,19 +94,141 @@ lcd_bus.RGBBus(data, hsync, vsync, de, pclk, width, height, *,
                refresh_on_demand=False, bb_size_px=0)
 ```
 
+---
+
+## write(buf, *, cmd=-1, addr=0, multiline=True)
+
+Two modes determined by `cmd`:
+
+| | DMA mode `write(buf)` | Polling mode `write(buf, cmd=...)` |
+|---|---|---|
+| Trigger | `cmd` not passed (default -1) | `cmd >= 0` |
+| Transfer | `spi_device_queue_trans` (hardware DMA) | `spi_device_polling_transmit` (blocking) |
+| Returns | `trans_id` (int) | `None` |
+| cmd/addr phase | None | Yes (8-bit cmd + 24-bit addr) |
+| Async? | Async, returns immediately | Sync, returns after completion |
+| Queue depth | Up to 4 (`SPI_DMA_QUEUE_DEPTH`) | No queue |
+| Use case | Bulk pixel data | LCD commands, pixel preamble |
+
+**Parameters:**
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `buf` | buffer | required | Data to send, can be empty `b''` |
+| `cmd` | int | -1 | QSPI command byte; >=0 triggers polling mode |
+| `addr` | int | 0 | QSPI address (24-bit), e.g. `cmd<<8` or `0x002C00` |
+| `multiline` | bool | True | `True`=cmd/addr on 4 lines, `False`=cmd/addr on D0 only |
+
+**Polling mode details:**
+- Calls `spi_drain_pending()` first to flush DMA queue and preserve ordering
+- Uses `spi_transaction_ext_t` + `SPI_TRANS_VARIABLE_CMD|SPI_TRANS_VARIABLE_ADDR`
+- Per-transaction `command_bits=8, address_bits=24` (device config unchanged)
+- `multiline=True` → adds `MULTILINE_CMD|MULTILINE_ADDR` (cmd/addr 4-line)
+- `multiline=False` → cmd/addr on D0 only (1-line, no MULTILINE flags)
+- Empty `buf` (`b''`) → sends only cmd+addr phases, no data phase
+
+### QSPI Display Example (RM67162)
+
 ```python
-bus = lcd_bus.RGBBus(
-    data=(0,1,2,3,4,5,6,7),
-    hsync=12, vsync=13, de=14, pclk=15,
-    width=480, height=272,
-)
+cs = Pin(6, Pin.OUT, value=1)
+
+def tx_param(cmd, params=b''):
+    cs.low()
+    bus.write(params if params else b'\x00', cmd=0x02, addr=cmd << 8)
+    cs.high()
+
+def tx_color_pre():
+    cs.low()
+    bus.write(b'', cmd=0x32, addr=0x002C00, multiline=False)
+    # CS stays low across all pixel data chunks
+    cs.high()
+
+# Init sequence
+tx_param(0x11)           # SLPOUT
+time.sleep_ms(120)
+tx_param(0x36, b'\x00')  # MADCTL
+tx_param(0x36, b'\x00')  # MADCTL (sent twice per RM67162 spec)
+tx_param(0x3A, b'\x75')  # COLMOD 16bpp
+tx_param(0x29)           # DISPON
+
+# Send pixel data (CS low across preamble + all chunks)
+cs.low()
+bus.write(b'', cmd=0x32, addr=0x002C00, multiline=False)
+for chunk in chunks:
+    tid = bus.write(chunk)
+    bus.wait(tid)
+cs.high()
 ```
 
-## Usage Pattern
+---
+
+## DMA Queue Usage Patterns
+
+### Pattern 1: write + wait (safe, buffer reuse)
+
+```python
+for chunk in chunks:
+    tid = bus.write(chunk)    # DMA starts reading chunk
+    bus.wait(tid)             # wait → chunk safe to overwrite
+```
+
+### Pattern 2: Fire-and-forget multiple (independent buffers)
+
+```python
+bus.write(buf_a)   # DMA enqueue
+bus.write(buf_b)   # DMA enqueue
+bus.write(buf_c)   # DMA enqueue
+bus.wait_all()     # wait for all
+# ⚠️ buf_a/buf_b/buf_c must not be overwritten until wait_all
+```
+
+### Pattern 3: Non-blocking CPU parallel
+
+```python
+tid = bus.write(chunk)      # fire 32KB, returns immediately
+calculate_something()        # CPU works in parallel
+bus.wait(tid)               # wait for DMA
+```
+
+### Pattern 4: Wait for specific transaction
+
+```python
+tid_a = bus.write(chunk_a)
+tid_b = bus.write(chunk_b)
+bus.wait(tid_a)             # wait only for chunk_a
+bus.wait(tid_b)
+```
+
+### Queue Full
+
+5th write raises `RuntimeError("queue full")` immediately (does not block):
+
+```python
+try:
+    for _ in range(5):
+        bus.write(bytearray(64))
+except RuntimeError as e:
+    print(e)  # "queue full"
+```
+
+### Queue Depth
+
+`SPI_DMA_QUEUE_DEPTH = 4` is not a hardware DMA limit — it's a memory optimization (~28 bytes/slot). Adjust in `esp32_include/spi_bus.h`. 4 is sufficient for the common `write → wait` serial pattern.
+
+### Non-blocking Check
+
+```python
+done = bus.wait(tid, timeout_ms=0)   # True=done, False=still in-flight
+bus.is_busy()                         # True=any pending
+bus.pending()                         # count of pending (0~4)
+```
+
+---
+
+## Standard SPI Example
 
 ```python
 import lcd_bus
-import heap_caps
 from machine import Pin
 
 dc = Pin(37, Pin.OUT)
@@ -120,49 +236,45 @@ cs = Pin(38, Pin.OUT)
 
 bus = lcd_bus.SPIBus(data=(35,), clk=36, freq=40_000_000)
 
-fb = heap_caps.malloc(320 * 240 * 2, heap_caps.CAP_DMA)
-
 cs.low()
 dc.low()
 bus.write(b'\x11')
 bus.wait_all()
-
 dc.high()
+
 tid = bus.write(fb)         # fire-and-forget
 while bus.is_busy():        # CPU does other work
     read_sensor()
 bus.wait(tid)               # confirm done
+cs.high()
 
 bus.deinit()
-heap_caps.free(fb)
 ```
 
-## Double Buffering
+## Testing
 
-4-level queue (SPI/I80) or 2-level (RGB) built in:
+Run on ESP32 device:
 
 ```python
-buf_a = heap_caps.malloc(FRAME, heap_caps.CAP_DMA)
-buf_b = heap_caps.malloc(FRAME, heap_caps.CAP_DMA)
-
-while True:
-    render(buf_a)
-    bus.write(buf_a)
-    render(buf_b)
-    bus.write(buf_b)
-    if bus.pending() >= 2:
-        bus.wait_all()
+import test_bus
+test_bus.run_all()
 ```
+
+Test suite (7 areas, 23 assertions):
+
+| # | Test | Description | Assertions |
+|---|------|-------------|------------|
+| 1 | `test_spi` | SPI init, write, 4-deep queue, queue-full guard, deinit | 11 |
+| 2 | `test_spi_multilane` | Auto-detect 1/2/4/8-lane from `data` tuple | 4 |
+| 3 | `test_spi_official` | Full-duplex (sck/mosi/miso), `readinto()` | 5 |
+| 4 | `test_speed` | Throughput benchmarks (1/2/4 lanes, 40/80 MHz) | output only |
+| 5 | `test_i80` | I80 parallel bus (SKIP if not available) | 0 |
+| 6 | `test_rgb` | RGB parallel bus (SKIP if not available) | 0 |
+| 7 | `test_rapid` | Rapid init→write→deinit stress (3 cycles) | 3 |
 
 ## Build
 
 CMake-based (ESP-IDF): add this repo as a User C Module.
-
-```
-Sources: modlcd_bus.c, lcd_types.c,
-         esp32_src/spi_bus.c, esp32_src/i2c_bus.c,
-         esp32_src/i80_bus.c, esp32_src/rgb_bus.c
-```
 
 Non-ESP32 ports: stubs raise `NotImplementedError`.
 
