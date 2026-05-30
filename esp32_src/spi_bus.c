@@ -13,6 +13,7 @@
 #include <string.h>
 
 static spi_device_handle_t  s_spi_device[SOC_SPI_PERIPH_NUM];
+static uint8_t             *s_spi_zero_buf[SOC_SPI_PERIPH_NUM];
 
 static uint32_t lane_flag(int n) {
     switch (n) {
@@ -78,6 +79,7 @@ static void spi_deinit_hardware(mp_lcd_spi_bus_obj_t *self) {
     }
 
     if (self->zero_buf) { heap_caps_free(self->zero_buf); self->zero_buf = NULL; }
+    if (self->host < SOC_SPI_PERIPH_NUM) s_spi_zero_buf[self->host] = NULL;
     self->initialized = false;
 }
 
@@ -153,6 +155,11 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         for (int i = 2; i < 8; i++) self->data_pins[i] = -1;
     }
 
+    if (s_spi_zero_buf[host]) {
+        heap_caps_free(s_spi_zero_buf[host]);
+        s_spi_zero_buf[host] = NULL;
+    }
+
     self->zero_buf = (uint8_t *)heap_caps_calloc(1, 32768, MALLOC_CAP_DMA);
     if (!self->zero_buf) {
         gc_collect();
@@ -162,6 +169,7 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         m_del_obj(mp_lcd_spi_bus_obj_t, self);
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DMA zero buffer alloc failed"));
     }
+    s_spi_zero_buf[host] = self->zero_buf;
 
     spi_bus_config_t bcfg = {
         .mosi_io_num   = self->data_pins[0],
@@ -191,6 +199,7 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     esp_err_t ret = spi_bus_initialize(self->host, &bcfg, SPI_DMA_CH_AUTO);
     if (ret != ESP_OK) {
         heap_caps_free(self->zero_buf);
+        s_spi_zero_buf[host] = NULL;
         m_del_obj(mp_lcd_spi_bus_obj_t, self);
         mp_raise_msg_varg(&mp_type_RuntimeError,
             MP_ERROR_TEXT("spi_bus_initialize err=0x%x"), ret);
@@ -198,6 +207,7 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     ret = spi_bus_add_device(self->host, &dcfg, &self->handle);
     if (ret != ESP_OK) {
         heap_caps_free(self->zero_buf);
+        s_spi_zero_buf[host] = NULL;
         spi_bus_free(self->host);
         m_del_obj(mp_lcd_spi_bus_obj_t, self);
         mp_raise_msg_varg(&mp_type_RuntimeError,
