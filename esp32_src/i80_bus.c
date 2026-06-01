@@ -122,7 +122,7 @@ static mp_obj_t i80_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     enum { ARG_self, ARG_buf, ARG_cmd };
     static const mp_arg_t allowed[] = {
         { MP_QSTR_self, MP_ARG_OBJ | MP_ARG_REQUIRED },
-        { MP_QSTR_buf,  MP_ARG_OBJ | MP_ARG_KW_ONLY },
+        { MP_QSTR_buf,  MP_ARG_OBJ | MP_ARG_REQUIRED },
         { MP_QSTR_cmd,  MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
@@ -136,23 +136,25 @@ static mp_obj_t i80_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
 
     int idx = self->queue_tail;
 
-    if (args[ARG_buf].u_obj != MP_OBJ_NULL) {
-        mp_obj_array_t *a = (mp_obj_array_t *)args[ARG_buf].u_obj;
-        self->ref_bufs[idx] = args[ARG_buf].u_obj;
-        self->done_flags[idx] = false;
-        if (esp_lcd_panel_io_tx_color(self->panel_io, cmd, a->items, a->len) != ESP_OK) {
-            self->ref_bufs[idx] = mp_const_none;
-            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_color failed"));
-        }
-    } else {
-        // cmd only — use tx_param (synchronous, no DMA queue needed)
-        if (esp_lcd_panel_io_tx_param(self->panel_io, cmd, NULL, 0) != ESP_OK)
-            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_param failed"));
-        return mp_const_none;
+    mp_obj_array_t *a = (mp_obj_array_t *)args[ARG_buf].u_obj;
+    self->ref_bufs[idx] = args[ARG_buf].u_obj;
+    self->done_flags[idx] = false;
+
+    // 把 Python buffer 複製到固定 tx_buf，避免 DMA 讀到蓋掉的資料
+    size_t len = a->len;
+    if (len > sizeof(self->tx_buf)) len = sizeof(self->tx_buf);
+    memcpy(self->tx_buf, a->items, len);
+
+    if (esp_lcd_panel_io_tx_color(self->panel_io, cmd, self->tx_buf, len) != ESP_OK) {
+        self->ref_bufs[idx] = mp_const_none;
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_color failed"));
     }
 
     self->queue_tail = (self->queue_tail + 1) % I80_DMA_QUEUE_DEPTH;
     self->queue_count++;
+
+
+
     return mp_obj_new_int(idx + 1);
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(i80_write_obj, 1, i80_write);
