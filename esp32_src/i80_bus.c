@@ -119,27 +119,37 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
 
 
 static mp_obj_t i80_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
-    enum { ARG_self, ARG_buf };
+    enum { ARG_self, ARG_buf, ARG_cmd };
     static const mp_arg_t allowed[] = {
         { MP_QSTR_self, MP_ARG_OBJ | MP_ARG_REQUIRED },
-        { MP_QSTR_buf,  MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_buf,  MP_ARG_OBJ | MP_ARG_KW_ONLY },
+        { MP_QSTR_cmd,  MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
     mp_lcd_i80_bus_obj_t *self = (mp_lcd_i80_bus_obj_t *)args[ARG_self].u_obj;
-    mp_obj_array_t *a = (mp_obj_array_t *)args[ARG_buf].u_obj;
+    int cmd = args[ARG_cmd].u_int;
 
     if (self->queue_count >= I80_DMA_QUEUE_DEPTH)
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
 
     int idx = self->queue_tail;
-    self->ref_bufs[idx] = args[ARG_buf].u_obj;
-    self->done_flags[idx] = false;
 
-    if (esp_lcd_panel_io_tx_color(self->panel_io, -1, a->items, a->len) != ESP_OK) {
+    if (args[ARG_buf].u_obj != MP_OBJ_NULL) {
+        mp_obj_array_t *a = (mp_obj_array_t *)args[ARG_buf].u_obj;
+        self->ref_bufs[idx] = args[ARG_buf].u_obj;
+        self->done_flags[idx] = false;
+        if (esp_lcd_panel_io_tx_color(self->panel_io, cmd, a->items, a->len) != ESP_OK) {
+            self->ref_bufs[idx] = mp_const_none;
+            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_color failed"));
+        }
+    } else {
+        // cmd only, no buffer
         self->ref_bufs[idx] = mp_const_none;
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_color failed"));
+        self->done_flags[idx] = true;
+        if (esp_lcd_panel_io_tx_color(self->panel_io, cmd, NULL, 0) != ESP_OK)
+            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_color failed"));
     }
 
     self->queue_tail = (self->queue_tail + 1) % I80_DMA_QUEUE_DEPTH;
@@ -149,14 +159,7 @@ static mp_obj_t i80_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
 static MP_DEFINE_CONST_FUN_OBJ_KW(i80_write_obj, 2, i80_write);
 
 
-static mp_obj_t i80_write_cmd(mp_obj_t self_in, mp_obj_t cmd_in) {
-    mp_lcd_i80_bus_obj_t *self = (mp_lcd_i80_bus_obj_t *)self_in;
-    int cmd = mp_obj_get_int(cmd_in);
-    if (esp_lcd_panel_io_tx_color(self->panel_io, cmd, NULL, 0) != ESP_OK)
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_color failed"));
-    return mp_const_none;
-}
-static MP_DEFINE_CONST_FUN_OBJ_2(i80_write_cmd_obj, i80_write_cmd);
+
 
 
 static mp_obj_t i80_is_busy(mp_obj_t self_in) {
@@ -279,7 +282,7 @@ static MP_DEFINE_CONST_FUN_OBJ_1(i80_deinit_obj, i80_deinit);
 
 static const mp_rom_map_elem_t i80_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_write),      MP_ROM_PTR(&i80_write_obj) },
-    { MP_ROM_QSTR(MP_QSTR_write_cmd),  MP_ROM_PTR(&i80_write_cmd_obj) },
+
     { MP_ROM_QSTR(MP_QSTR_is_busy),    MP_ROM_PTR(&i80_is_busy_obj) },
     { MP_ROM_QSTR(MP_QSTR_pending),    MP_ROM_PTR(&i80_pending_obj) },
     { MP_ROM_QSTR(MP_QSTR_lane_count), MP_ROM_PTR(&i80_lane_count_obj) },
