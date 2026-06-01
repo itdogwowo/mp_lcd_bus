@@ -25,7 +25,8 @@ typedef struct _mp_lcd_i80_bus_obj_t {
     int wr_pin, dc_pin, cs_pin, freq;
 
     bool initialized;
-    uint8_t tx_buf[128];  // 固定 DMA 緩衝，Python 寫入後 C 層複製再 DMA mp_lcd_i80_bus_obj_t;
+    uint8_t tx_buf[128];  // 固定 DMA 緩衝
+} mp_lcd_i80_bus_obj_t;
 
 extern const mp_obj_type_t mp_lcd_i80_bus_type;
 
