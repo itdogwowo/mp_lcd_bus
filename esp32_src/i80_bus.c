@@ -192,10 +192,10 @@ static mp_obj_t i80_wait(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_a
     int idx = tid - 1;
 
     if (idx < 0 || idx >= I80_DMA_QUEUE_DEPTH) return mp_const_false;
-    if (self->ref_bufs[idx] == mp_const_none) return mp_const_true;
+    if (!self->pending[idx]) return mp_const_true;
 
     mp_uint_t deadline = mp_hal_ticks_ms() + (to < 0 ? 10000 : to);
-    while (!self->done_flags[idx]) {
+    while (self->pending[idx]) {
         if (to >= 0 && mp_hal_ticks_ms() > deadline) return mp_const_false;
         mp_hal_delay_ms(1);
     }
@@ -264,8 +264,7 @@ static mp_obj_t i80_deinit(mp_obj_t self_in) {
 
     // 釋放 DMA buffer references
     for (int i = 0; i < I80_DMA_QUEUE_DEPTH; i++) {
-        self->ref_bufs[i] = mp_const_none;
-        self->done_flags[i] = false;
+        self->pending[i] = false;
     }
     self->queue_head = self->queue_tail = self->queue_count = 0;
 
