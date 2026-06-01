@@ -156,7 +156,7 @@ static mp_obj_t i80_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     self->queue_count++;
     return mp_obj_new_int(idx + 1);
 }
-static MP_DEFINE_CONST_FUN_OBJ_KW(i80_write_obj, 2, i80_write);
+static MP_DEFINE_CONST_FUN_OBJ_KW(i80_write_obj, 1, i80_write);
 
 
 
