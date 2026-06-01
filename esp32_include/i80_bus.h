@@ -22,7 +22,7 @@ typedef struct _mp_lcd_i80_bus_obj_t {
 
     int lane_count;
     int data_pins[16];
-    int wr_pin, cs_pin, freq;
+    int wr_pin, dc_pin, cs_pin, freq;
 
     bool initialized;
 } mp_lcd_i80_bus_obj_t;

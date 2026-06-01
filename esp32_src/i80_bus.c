@@ -37,10 +37,11 @@ static bool on_color_done(esp_lcd_panel_io_handle_t panel_io,
 
 
 static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
-    enum { ARG_data, ARG_wr, ARG_cs, ARG_freq };
+    enum { ARG_data, ARG_wr, ARG_dc, ARG_cs, ARG_freq };
     static const mp_arg_t allowed[] = {
         { MP_QSTR_data, MP_ARG_OBJ | MP_ARG_REQUIRED },
         { MP_QSTR_wr,   MP_ARG_INT | MP_ARG_REQUIRED },
+        { MP_QSTR_dc,   MP_ARG_INT | MP_ARG_REQUIRED },
         { MP_QSTR_cs,   MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
         { MP_QSTR_freq, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 10000000} },
     };
@@ -57,14 +58,19 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     self->base.type = &mp_lcd_i80_bus_type;
     self->lane_count = (int)n;
     self->wr_pin = args[ARG_wr].u_int;
+    self->dc_pin = args[ARG_dc].u_int;
     self->cs_pin = args[ARG_cs].u_int;
     self->freq   = args[ARG_freq].u_int;
 
     for (int i = 0; i < 16; i++)
         self->data_pins[i] = (i < (int)n) ? mp_obj_get_int(items[i]) : -1;
 
+    // 清理前一次殘留（soft reboot 安全網）
+    if (s_last_i80_panel_io) { esp_lcd_panel_io_del(s_last_i80_panel_io); s_last_i80_panel_io = NULL; }
+    if (s_last_i80_bus)      { esp_lcd_del_i80_bus(s_last_i80_bus);        s_last_i80_bus = NULL; }
+
     esp_lcd_i80_bus_config_t bcfg = {
-        .dc_gpio_num = -1,
+        .dc_gpio_num = self->dc_pin,
         .wr_gpio_num = self->wr_pin,
         .clk_src     = LCD_CLK_SRC_PLL160M,
         .bus_width   = (size_t)n,
@@ -73,9 +79,6 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         .sram_trans_align  = 64,
     };
     for (int i = 0; i < 16; i++) bcfg.data_gpio_nums[i] = self->data_pins[i];
-
-    if (s_last_i80_panel_io) { esp_lcd_panel_io_del(s_last_i80_panel_io); s_last_i80_panel_io = NULL; }
-    if (s_last_i80_bus)      { esp_lcd_del_i80_bus(s_last_i80_bus);        s_last_i80_bus = NULL; }
 
     esp_err_t ret = esp_lcd_new_i80_bus(&bcfg, &self->bus_handle);
     if (ret != ESP_OK) {
@@ -204,60 +207,85 @@ static mp_obj_t i80_wait_all(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
     mp_uint_t deadline = mp_hal_ticks_ms() + (to < 0 ? 10000 : to);
 
     while (self->queue_count > 0) {
-        if (to >= 0 && mp_hal_ticks_ms() > deadline) break;
+        if (to >= 0 && mp_hal_ticks_ms() > deadline) return mp_const_false;
         mp_hal_delay_ms(1);
     }
-    gc_collect();
-    return mp_const_none;
+    return mp_const_true;
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(i80_wait_all_obj, 1, i80_wait_all);
 
 
-static mp_obj_t i80_deinit(mp_obj_t self_in) {
-    mp_lcd_i80_bus_obj_t *self = (mp_lcd_i80_bus_obj_t *)self_in;
-    if (!self->initialized) return mp_const_none;
-    if (s_last_i80_panel_io == self->panel_io) s_last_i80_panel_io = NULL;
-    if (s_last_i80_bus == self->bus_handle)   s_last_i80_bus = NULL;
-    esp_lcd_panel_io_del(self->panel_io);
-    esp_lcd_del_i80_bus(self->bus_handle);
-
-    int8_t pins[18];
+static void i80_reset_gpios(mp_lcd_i80_bus_obj_t *self) {
+    // 把用過的 I80 腳全部恢復成 floating input，避免 soft reboot 後殘留
+    int pins[18];
     int p = 0;
     pins[p++] = self->wr_pin;
-    if (self->cs_pin != -1) pins[p++] = self->cs_pin;
-    for (int i = 0; i < self->lane_count; i++) {
-        if (self->data_pins[i] != -1) pins[p++] = self->data_pins[i];
+    pins[p++] = self->dc_pin;
+    for (int i = 0; i < 16 && i < self->lane_count; i++) {
+        if (self->data_pins[i] >= 0) pins[p++] = self->data_pins[i];
     }
     for (int i = 0; i < p; i++) {
         esp_rom_gpio_pad_select_gpio(pins[i]);
         esp_rom_gpio_connect_out_signal(pins[i], SIG_GPIO_OUT_IDX, false, false);
         gpio_set_direction(pins[i], GPIO_MODE_INPUT);
     }
+}
 
+
+static mp_obj_t i80_deinit(mp_obj_t self_in) {
+    mp_lcd_i80_bus_obj_t *self = (mp_lcd_i80_bus_obj_t *)self_in;
+    if (!self->initialized) return mp_const_none;
+
+    // 先暫存，避免 NULL 後無法比對
+    esp_lcd_i80_bus_handle_t bus_h = self->bus_handle;
+    esp_lcd_panel_io_handle_t io_h = self->panel_io;
+
+    self->bus_handle = NULL;
+    self->panel_io  = NULL;
     self->initialized = false;
+
+    if (io_h) esp_lcd_panel_io_del(io_h);
+    if (bus_h) esp_lcd_del_i80_bus(bus_h);
+
+    // 清除全域 tracking
+    if (s_last_i80_bus == bus_h)       s_last_i80_bus = NULL;
+    if (s_last_i80_panel_io == io_h)   s_last_i80_panel_io = NULL;
+
+    // 釋放 DMA buffer references
+    for (int i = 0; i < I80_DMA_QUEUE_DEPTH; i++) {
+        self->ref_bufs[i] = mp_const_none;
+        self->done_flags[i] = false;
+    }
+    self->queue_head = self->queue_tail = self->queue_count = 0;
+
+    // GPIO 復位 — 同 SPI 做法
+    i80_reset_gpios(self);
+
+    gc_collect();
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(i80_deinit_obj, i80_deinit);
 
 
-static const mp_rom_map_elem_t i80_locals_table[] = {
+static const mp_rom_map_elem_t i80_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_write),      MP_ROM_PTR(&i80_write_obj) },
     { MP_ROM_QSTR(MP_QSTR_is_busy),    MP_ROM_PTR(&i80_is_busy_obj) },
     { MP_ROM_QSTR(MP_QSTR_pending),    MP_ROM_PTR(&i80_pending_obj) },
+    { MP_ROM_QSTR(MP_QSTR_lane_count), MP_ROM_PTR(&i80_lane_count_obj) },
     { MP_ROM_QSTR(MP_QSTR_wait),       MP_ROM_PTR(&i80_wait_obj) },
     { MP_ROM_QSTR(MP_QSTR_wait_all),   MP_ROM_PTR(&i80_wait_all_obj) },
-    { MP_ROM_QSTR(MP_QSTR_lane_count), MP_ROM_PTR(&i80_lane_count_obj) },
     { MP_ROM_QSTR(MP_QSTR_deinit),     MP_ROM_PTR(&i80_deinit_obj) },
     { MP_ROM_QSTR(MP_QSTR___del__),    MP_ROM_PTR(&i80_deinit_obj) },
 };
-static MP_DEFINE_CONST_DICT(i80_locals_dict, i80_locals_table);
+static MP_DEFINE_CONST_DICT(i80_locals_dict, i80_locals_dict_table);
+
 
 MP_DEFINE_CONST_OBJ_TYPE(
     mp_lcd_i80_bus_type,
     MP_QSTR_I80Bus,
     MP_TYPE_FLAG_NONE,
     make_new, i80_make_new,
-    locals_dict, (mp_obj_dict_t *)&i80_locals_dict
+    locals_dict, &i80_locals_dict
 );
 
-#endif
+#endif /*SOC_LCD_I80_SUPPORTED*/
