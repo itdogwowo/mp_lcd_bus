@@ -24,9 +24,8 @@ static bool on_color_done(esp_lcd_panel_io_handle_t panel_io,
                           esp_lcd_panel_io_event_data_t *edata, void *ctx) {
     mp_lcd_i80_bus_obj_t *self = (mp_lcd_i80_bus_obj_t *)ctx;
     for (int i = 0; i < I80_DMA_QUEUE_DEPTH; i++) {
-        if (self->ref_bufs[i] != mp_const_none && !self->done_flags[i]) {
-            self->done_flags[i] = true;
-            self->ref_bufs[i] = mp_const_none;
+        if (self->pending[i]) {
+            self->pending[i] = false;
             self->queue_head = (self->queue_head + 1) % I80_DMA_QUEUE_DEPTH;
             self->queue_count--;
             break;
@@ -106,8 +105,7 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
             MP_ERROR_TEXT("esp_lcd_new_panel_io_i80 err=0x%x"), ret);
     }
 
-    memset(self->ref_bufs, 0, sizeof(self->ref_bufs));
-    memset(self->done_flags, 0, sizeof(self->done_flags));
+    memset(self->pending, 0, sizeof(self->pending));
     self->queue_head = self->queue_tail = self->queue_count = 0;
     self->initialized = true;
 
@@ -137,8 +135,7 @@ static mp_obj_t i80_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     int idx = self->queue_tail;
 
     mp_obj_array_t *a = (mp_obj_array_t *)args[ARG_buf].u_obj;
-    self->ref_bufs[idx] = args[ARG_buf].u_obj;
-    self->done_flags[idx] = false;
+    self->pending[idx] = true;
 
     // 把 Python buffer 複製到固定 tx_buf，避免 DMA 讀到蓋掉的資料
     size_t len = a->len;
@@ -146,7 +143,7 @@ static mp_obj_t i80_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     memcpy(self->tx_buf, a->items, len);
 
     if (esp_lcd_panel_io_tx_color(self->panel_io, cmd, self->tx_buf, len) != ESP_OK) {
-        self->ref_bufs[idx] = mp_const_none;
+        self->pending[idx] = false;
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_color failed"));
     }
 

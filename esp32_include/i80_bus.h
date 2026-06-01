@@ -16,8 +16,7 @@ typedef struct _mp_lcd_i80_bus_obj_t {
     esp_lcd_i80_bus_handle_t bus_handle;
     esp_lcd_panel_io_handle_t panel_io;
 
-    mp_obj_t ref_bufs[I80_DMA_QUEUE_DEPTH];
-    bool done_flags[I80_DMA_QUEUE_DEPTH];
+    bool pending[I80_DMA_QUEUE_DEPTH];  // DMA 完成旗標
     int queue_head, queue_tail, queue_count;
 
     int lane_count;
