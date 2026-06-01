@@ -145,11 +145,10 @@ static mp_obj_t i80_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
             mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_color failed"));
         }
     } else {
-        // cmd only, no buffer
-        self->ref_bufs[idx] = mp_const_none;
-        self->done_flags[idx] = true;
-        if (esp_lcd_panel_io_tx_color(self->panel_io, cmd, NULL, 0) != ESP_OK)
-            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_color failed"));
+        // cmd only — use tx_param (synchronous, no DMA queue needed)
+        if (esp_lcd_panel_io_tx_param(self->panel_io, cmd, NULL, 0) != ESP_OK)
+            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_param failed"));
+        return mp_const_none;
     }
 
     self->queue_tail = (self->queue_tail + 1) % I80_DMA_QUEUE_DEPTH;
