@@ -277,6 +277,29 @@ static mp_obj_t spi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
 static MP_DEFINE_CONST_FUN_OBJ_KW(spi_write_obj, 2, spi_write);
 
 
+static mp_obj_t spi_write_cmd(mp_obj_t self_in, mp_obj_t cmd_in) {
+    mp_lcd_spi_bus_obj_t *self = (mp_lcd_spi_bus_obj_t *)self_in;
+    int cmd = mp_obj_get_int(cmd_in);
+
+    if (self->lane_count > 1) {
+        // QSPI: cmd as address in multiline write
+        spi_drain_pending(self);
+        spi_transaction_ext_t t;
+        memset(&t, 0, sizeof(t));
+        t.base.flags = SPI_TRANS_VARIABLE_CMD | SPI_TRANS_VARIABLE_ADDR
+                     | SPI_TRANS_MULTILINE_CMD | SPI_TRANS_MULTILINE_ADDR;
+        t.command_bits = 8;
+        t.address_bits = 8;
+        t.base.cmd  = 0x02;
+        t.base.addr = (uint32_t)cmd;
+        t.base.length = 0;
+        spi_device_polling_transmit(self->handle, (spi_transaction_t *)&t);
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(spi_write_cmd_obj, spi_write_cmd);
+
+
 static mp_obj_t spi_readinto(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     enum { ARG_self, ARG_buf, ARG_write_val };
     static const mp_arg_t allowed[] = {
@@ -447,6 +470,7 @@ static MP_DEFINE_CONST_FUN_OBJ_1(spi_deinit_obj, spi_deinit);
 
 static const mp_rom_map_elem_t spi_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_write),          MP_ROM_PTR(&spi_write_obj) },
+    { MP_ROM_QSTR(MP_QSTR_write_cmd),     MP_ROM_PTR(&spi_write_cmd_obj) },
     { MP_ROM_QSTR(MP_QSTR_readinto),       MP_ROM_PTR(&spi_readinto_obj) },
     { MP_ROM_QSTR(MP_QSTR_write_readinto), MP_ROM_PTR(&spi_write_readinto_obj) },
     { MP_ROM_QSTR(MP_QSTR_is_busy),        MP_ROM_PTR(&spi_is_busy_obj) },

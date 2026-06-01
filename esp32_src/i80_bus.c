@@ -149,6 +149,16 @@ static mp_obj_t i80_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
 static MP_DEFINE_CONST_FUN_OBJ_KW(i80_write_obj, 2, i80_write);
 
 
+static mp_obj_t i80_write_cmd(mp_obj_t self_in, mp_obj_t cmd_in) {
+    mp_lcd_i80_bus_obj_t *self = (mp_lcd_i80_bus_obj_t *)self_in;
+    int cmd = mp_obj_get_int(cmd_in);
+    if (esp_lcd_panel_io_tx_color(self->panel_io, cmd, NULL, 0) != ESP_OK)
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_color failed"));
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(i80_write_cmd_obj, i80_write_cmd);
+
+
 static mp_obj_t i80_is_busy(mp_obj_t self_in) {
     return mp_obj_new_bool(((mp_lcd_i80_bus_obj_t *)self_in)->queue_count > 0);
 }
@@ -269,6 +279,7 @@ static MP_DEFINE_CONST_FUN_OBJ_1(i80_deinit_obj, i80_deinit);
 
 static const mp_rom_map_elem_t i80_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_write),      MP_ROM_PTR(&i80_write_obj) },
+    { MP_ROM_QSTR(MP_QSTR_write_cmd),  MP_ROM_PTR(&i80_write_cmd_obj) },
     { MP_ROM_QSTR(MP_QSTR_is_busy),    MP_ROM_PTR(&i80_is_busy_obj) },
     { MP_ROM_QSTR(MP_QSTR_pending),    MP_ROM_PTR(&i80_pending_obj) },
     { MP_ROM_QSTR(MP_QSTR_lane_count), MP_ROM_PTR(&i80_lane_count_obj) },
