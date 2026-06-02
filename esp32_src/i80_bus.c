@@ -1,4 +1,5 @@
 #include "soc/soc_caps.h"
+#include "driver/periph_ctrl.h"
 
 #if SOC_LCD_I80_SUPPORTED
 
@@ -63,7 +64,11 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     for (int i = 0; i < 16; i++)
         self->data_pins[i] = (i < (int)n) ? mp_obj_get_int(items[i]) : -1;
 
-    // 不清理前一次——ESP-IDF 內部有 refcount，新 bus 會自行配置
+    // 強制重啟 LCD_CAM 硬體，釋放前一次佔用的資源
+    periph_module_disable(PERIPH_LCD_CAM_MODULE);
+    mp_hal_delay_ms(10);
+    periph_module_enable(PERIPH_LCD_CAM_MODULE);
+    mp_hal_delay_ms(10);
 
     esp_lcd_i80_bus_config_t bcfg = {
         .dc_gpio_num = self->dc_pin,
