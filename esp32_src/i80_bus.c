@@ -1,5 +1,4 @@
 #include "soc/soc_caps.h"
-#include "driver/periph_ctrl.h"
 
 #if SOC_LCD_I80_SUPPORTED
 
@@ -17,6 +16,9 @@
 #include "driver/gpio.h"
 
 #include <string.h>
+
+static esp_lcd_i80_bus_handle_t  s_last_i80_bus = NULL;
+static esp_lcd_panel_io_handle_t s_last_i80_panel_io = NULL;
 
 static void i80_reset_gpios(mp_lcd_i80_bus_obj_t *self);
 
@@ -64,28 +66,33 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     for (int i = 0; i < 16; i++)
         self->data_pins[i] = (i < (int)n) ? mp_obj_get_int(items[i]) : -1;
 
-    // 強制重啟 LCD_CAM 硬體，釋放前一次佔用的資源
-    periph_module_disable(PERIPH_LCD_CAM_MODULE);
-    mp_hal_delay_ms(10);
-    periph_module_enable(PERIPH_LCD_CAM_MODULE);
-    mp_hal_delay_ms(10);
 
-    esp_lcd_i80_bus_config_t bcfg = {
-        .dc_gpio_num = self->dc_pin,
-        .wr_gpio_num = self->wr_pin,
-        .clk_src     = LCD_CLK_SRC_PLL160M,
-        .bus_width   = (size_t)n,
-        .max_transfer_bytes = 32768,
-        .psram_trans_align = 64,
-        .sram_trans_align  = 64,
-    };
-    for (int i = 0; i < 16; i++) bcfg.data_gpio_nums[i] = self->data_pins[i];
+    if (s_last_i80_bus) {
+        // 前一次 bus 仍有效，復用（ESP-IDF 在 soft reboot 後未 deinit）
+        self->bus_handle = s_last_i80_bus;
+        // 先刪舊 panel_io，避免 callback 指到舊的 dangling self
+        if (s_last_i80_panel_io) {
+            esp_lcd_panel_io_del(s_last_i80_panel_io);
+            s_last_i80_panel_io = NULL;
+        }
+    } else {
+        esp_lcd_i80_bus_config_t bcfg = {
+            .dc_gpio_num = self->dc_pin,
+            .wr_gpio_num = self->wr_pin,
+            .clk_src     = LCD_CLK_SRC_PLL160M,
+            .bus_width   = (size_t)n,
+            .max_transfer_bytes = 32768,
+            .psram_trans_align = 64,
+            .sram_trans_align  = 64,
+        };
+        for (int i = 0; i < 16; i++) bcfg.data_gpio_nums[i] = self->data_pins[i];
 
-    esp_err_t ret = esp_lcd_new_i80_bus(&bcfg, &self->bus_handle);
-    if (ret != ESP_OK) {
-        m_del_obj(mp_lcd_i80_bus_obj_t, self);
-        mp_raise_msg_varg(&mp_type_RuntimeError,
-            MP_ERROR_TEXT("esp_lcd_new_i80_bus err=0x%x"), ret);
+        esp_err_t ret = esp_lcd_new_i80_bus(&bcfg, &self->bus_handle);
+        if (ret != ESP_OK) {
+            m_del_obj(mp_lcd_i80_bus_obj_t, self);
+            mp_raise_msg_varg(&mp_type_RuntimeError,
+                MP_ERROR_TEXT("esp_lcd_new_i80_bus err=0x%x"), ret);
+        }
     }
 
     esp_lcd_panel_io_i80_config_t iocfg = {
@@ -111,7 +118,8 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     self->queue_head = self->queue_tail = self->queue_count = 0;
     self->initialized = true;
 
-    (void)0; // no s_last tracking
+    s_last_i80_bus = self->bus_handle;
+    s_last_i80_panel_io = self->panel_io;
 
     return MP_OBJ_FROM_PTR(self);
 }
@@ -259,7 +267,9 @@ static mp_obj_t i80_deinit(mp_obj_t self_in) {
     if (io_h) esp_lcd_panel_io_del(io_h);
     if (bus_h) esp_lcd_del_i80_bus(bus_h);
 
-    // 無全域 tracking
+    // 清除全域 tracking
+    if (s_last_i80_bus == bus_h)       s_last_i80_bus = NULL;
+    if (s_last_i80_panel_io == io_h)   s_last_i80_panel_io = NULL;
 
     // 釋放 DMA buffer references
     for (int i = 0; i < I80_DMA_QUEUE_DEPTH; i++) {
