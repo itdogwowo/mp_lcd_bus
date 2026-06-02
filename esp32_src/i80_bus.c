@@ -68,6 +68,8 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         self->data_pins[i] = (i < (int)n) ? mp_obj_get_int(items[i]) : -1;
 
 
+    esp_err_t ret;
+
     if (i80_needs_cleanup) {
         // 前一次佔用了硬體，先釋放
         if (s_last_i80_panel_io) { esp_lcd_panel_io_del(s_last_i80_panel_io); s_last_i80_panel_io = NULL; }
@@ -88,7 +90,7 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         };
         for (int i = 0; i < 16; i++) bcfg.data_gpio_nums[i] = self->data_pins[i];
 
-        esp_err_t ret = esp_lcd_new_i80_bus(&bcfg, &self->bus_handle);
+        ret = esp_lcd_new_i80_bus(&bcfg, &self->bus_handle);
         if (ret != ESP_OK) {
             m_del_obj(mp_lcd_i80_bus_obj_t, self);
             mp_raise_msg_varg(&mp_type_RuntimeError,
