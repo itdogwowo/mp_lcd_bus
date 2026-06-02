@@ -67,12 +67,12 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         self->data_pins[i] = (i < (int)n) ? mp_obj_get_int(items[i]) : -1;
 
     // 清理前一次殘留（soft reboot 安全網）
+    // 先等舊 DMA 完成再刪，避免刪除時還有進行中傳輸
+    if (s_last_i80_panel_io || s_last_i80_bus) {
+        mp_hal_delay_ms(100);
+    }
     if (s_last_i80_panel_io) { esp_lcd_panel_io_del(s_last_i80_panel_io); s_last_i80_panel_io = NULL; }
     if (s_last_i80_bus)      { esp_lcd_del_i80_bus(s_last_i80_bus);        s_last_i80_bus = NULL; }
-
-    // 先把 GPIO 復位成 input，讓硬體周邊完全冷啟動
-    i80_reset_gpios(self);
-    mp_hal_delay_ms(10);
 
     esp_lcd_i80_bus_config_t bcfg = {
         .dc_gpio_num = self->dc_pin,
