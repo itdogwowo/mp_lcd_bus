@@ -67,6 +67,8 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         self->data_pins[i] = (i < (int)n) ? mp_obj_get_int(items[i]) : -1;
 
 
+    esp_err_t ret;
+
     if (s_last_i80_bus) {
         // 前一次 bus 仍有效，復用（ESP-IDF 在 soft reboot 後未 deinit）
         self->bus_handle = s_last_i80_bus;
