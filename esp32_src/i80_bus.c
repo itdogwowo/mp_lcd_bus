@@ -155,11 +155,12 @@ static mp_obj_t i80_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
         return mp_const_none;
     }
 
-    mp_obj_array_t *a = (mp_obj_array_t *)args[ARG_buf].u_obj;
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(args[ARG_buf].u_obj, &bufinfo, MP_BUFFER_READ);
     self->pending[idx] = true;
 
-    // DMA 直接從 Python buffer——caller 持有 bytearray 引用，不會被 GC 回收
-    if (esp_lcd_panel_io_tx_color(self->panel_io, cmd, a->items, a->len) != ESP_OK) {
+    // DMA 直接從 Python buffer——caller 持有引用，不會被 GC 回收
+    if (esp_lcd_panel_io_tx_color(self->panel_io, cmd, bufinfo.buf, bufinfo.len) != ESP_OK) {
         self->pending[idx] = false;
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_color failed"));
     }
