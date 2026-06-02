@@ -19,6 +19,7 @@
 
 static esp_lcd_i80_bus_handle_t  s_last_i80_bus = NULL;
 static esp_lcd_panel_io_handle_t s_last_i80_panel_io = NULL;
+static bool i80_needs_cleanup = false;
 
 static void i80_reset_gpios(mp_lcd_i80_bus_obj_t *self);
 
@@ -69,15 +70,15 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
 
     esp_err_t ret;
 
-    if (s_last_i80_bus) {
-        // 前一次 bus 仍有效，復用（ESP-IDF 在 soft reboot 後未 deinit）
-        self->bus_handle = s_last_i80_bus;
-        // 先刪舊 panel_io，避免 callback 指到舊的 dangling self
-        if (s_last_i80_panel_io) {
-            esp_lcd_panel_io_del(s_last_i80_panel_io);
-            s_last_i80_panel_io = NULL;
-        }
-    } else {
+    if (i80_needs_cleanup) {
+        // 前一次佔用了硬體，先釋放
+        if (s_last_i80_panel_io) { esp_lcd_panel_io_del(s_last_i80_panel_io); s_last_i80_panel_io = NULL; }
+        if (s_last_i80_bus)      { esp_lcd_del_i80_bus(s_last_i80_bus);        s_last_i80_bus = NULL; }
+        mp_hal_delay_ms(50);  // 等硬體完全釋放
+    }
+    i80_needs_cleanup = false;
+
+    {
         esp_lcd_i80_bus_config_t bcfg = {
             .dc_gpio_num = self->dc_pin,
             .wr_gpio_num = self->wr_pin,
@@ -95,7 +96,6 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
             mp_raise_msg_varg(&mp_type_RuntimeError,
                 MP_ERROR_TEXT("esp_lcd_new_i80_bus err=0x%x"), ret);
         }
-    }
 
     esp_lcd_panel_io_i80_config_t iocfg = {
         .cs_gpio_num   = self->cs_pin,
@@ -122,6 +122,7 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
 
     s_last_i80_bus = self->bus_handle;
     s_last_i80_panel_io = self->panel_io;
+    i80_needs_cleanup = true;
 
     return MP_OBJ_FROM_PTR(self);
 }
