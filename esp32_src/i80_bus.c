@@ -201,7 +201,7 @@ static mp_obj_t i80_wait(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_a
     static const mp_arg_t allowed[] = {
         { MP_QSTR_self,       MP_ARG_OBJ | MP_ARG_REQUIRED },
         { MP_QSTR_trans_id,   MP_ARG_INT | MP_ARG_REQUIRED },
-        { MP_QSTR_timeout_ms, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 5000} },
+        { MP_QSTR_timeout_ms, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
@@ -228,17 +228,22 @@ static mp_obj_t i80_wait_all(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
     enum { ARG_self, ARG_timeout_ms };
     static const mp_arg_t allowed[] = {
         { MP_QSTR_self,       MP_ARG_OBJ | MP_ARG_REQUIRED },
-        { MP_QSTR_timeout_ms, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 5000} },
+        { MP_QSTR_timeout_ms, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
     mp_lcd_i80_bus_obj_t *self = (mp_lcd_i80_bus_obj_t *)args[ARG_self].u_obj;
     int to = args[ARG_timeout_ms].u_int;
-    mp_uint_t deadline = mp_hal_ticks_ms() + (to < 0 ? 5000 : to);
+    mp_uint_t deadline = mp_hal_ticks_ms() + (to < 0 ? 10000 : to);
 
     while (self->queue_count > 0) {
-        if (mp_hal_ticks_ms() > deadline) return mp_const_false;
+        if (mp_hal_ticks_ms() > deadline) {
+            // timeout: DMA 不回呼，強制清空 queue 避免卡死
+            for (int i = 0; i < I80_DMA_QUEUE_DEPTH; i++) self->pending[i] = false;
+            self->queue_head = self->queue_tail = self->queue_count = 0;
+            return mp_const_false;
+        }
         mp_hal_delay_ms(1);
     }
     return mp_const_true;
