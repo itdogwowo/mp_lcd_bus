@@ -157,12 +157,8 @@ static mp_obj_t i80_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     mp_obj_array_t *a = (mp_obj_array_t *)args[ARG_buf].u_obj;
     self->pending[idx] = true;
 
-    // 把 Python buffer 複製到固定 tx_buf，避免 DMA 讀到蓋掉的資料
-    size_t len = a->len;
-    if (len > sizeof(self->tx_buf)) len = sizeof(self->tx_buf);
-    memcpy(self->tx_buf, a->items, len);
-
-    if (esp_lcd_panel_io_tx_color(self->panel_io, cmd, self->tx_buf, len) != ESP_OK) {
+    // DMA 直接從 Python buffer——caller 持有 bytearray 引用，不會被 GC 回收
+    if (esp_lcd_panel_io_tx_color(self->panel_io, cmd, a->items, a->len) != ESP_OK) {
         self->pending[idx] = false;
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_color failed"));
     }

@@ -24,7 +24,7 @@ typedef struct _mp_lcd_i80_bus_obj_t {
     int wr_pin, dc_pin, cs_pin, freq;
 
     bool initialized;
-    uint8_t tx_buf[128];  // 固定 DMA 緩衝
+    // DMA 直接讀 Python bytearray，caller 持有引用
 } mp_lcd_i80_bus_obj_t;
 
 extern const mp_obj_type_t mp_lcd_i80_bus_type;
