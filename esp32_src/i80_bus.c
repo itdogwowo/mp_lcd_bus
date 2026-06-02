@@ -68,6 +68,10 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     if (s_last_i80_panel_io) { esp_lcd_panel_io_del(s_last_i80_panel_io); s_last_i80_panel_io = NULL; }
     if (s_last_i80_bus)      { esp_lcd_del_i80_bus(s_last_i80_bus);        s_last_i80_bus = NULL; }
 
+    // 先把 GPIO 復位成 input，讓硬體周邊完全冷啟動
+    i80_reset_gpios(self);
+    mp_hal_delay_ms(10);
+
     esp_lcd_i80_bus_config_t bcfg = {
         .dc_gpio_num = self->dc_pin,
         .wr_gpio_num = self->wr_pin,
