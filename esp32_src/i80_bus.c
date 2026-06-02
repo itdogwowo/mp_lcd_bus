@@ -148,10 +148,9 @@ static mp_obj_t i80_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     int idx = self->queue_tail;
 
     if (args[ARG_buf].u_obj == MP_OBJ_NULL) {
-        // 純指令：以 tx_color 送 cmd byte (DC=0) + 0 bytes data
-        uint32_t dummy = 0;
-        if (esp_lcd_panel_io_tx_color(self->panel_io, cmd, &dummy, 0) != ESP_OK)
-            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_color cmd failed"));
+        // 純指令：用 tx_param 才能確保 DC=0（跟 LVGL 實作一致）
+        if (esp_lcd_panel_io_tx_param(self->panel_io, cmd, NULL, 0) != ESP_OK)
+            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_param failed"));
         return mp_const_none;
     }
 
