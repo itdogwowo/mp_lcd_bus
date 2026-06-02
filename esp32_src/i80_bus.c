@@ -20,6 +20,8 @@
 static esp_lcd_i80_bus_handle_t  s_last_i80_bus = NULL;
 static esp_lcd_panel_io_handle_t s_last_i80_panel_io = NULL;
 
+static void i80_reset_gpios(mp_lcd_i80_bus_obj_t *self);
+
 static bool on_color_done(esp_lcd_panel_io_handle_t panel_io,
                           esp_lcd_panel_io_event_data_t *edata, void *ctx) {
     mp_lcd_i80_bus_obj_t *self = (mp_lcd_i80_bus_obj_t *)ctx;
