@@ -26,12 +26,12 @@ static uint32_t lane_flag(int n) {
 
 static int enqueue(mp_lcd_spi_bus_obj_t *self, const mp_obj_t buf, void *rx) {
     int idx = self->queue_tail;
-
-    mp_obj_array_t *a = (mp_obj_array_t *)buf;
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(buf, &bufinfo, MP_BUFFER_READ);
 
     memset(&self->trans[idx], 0, sizeof(spi_transaction_t));
-    self->trans[idx].length    = a->len * 8;
-    self->trans[idx].tx_buffer = a->items;
+    self->trans[idx].length    = bufinfo.len * 8;
+    self->trans[idx].tx_buffer = bufinfo.buf;
     self->trans[idx].rx_buffer = rx;
     self->trans[idx].flags     = lane_flag(self->lane_count);
     self->trans[idx].user      = (void *)(uintptr_t)(idx + 1);
@@ -295,15 +295,16 @@ static mp_obj_t spi_readinto(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
     if (self->queue_count >= SPI_DMA_QUEUE_DEPTH)
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
 
-    mp_obj_array_t *rx = (mp_obj_array_t *)args[ARG_buf].u_obj;
+    mp_buffer_info_t rxb;
+    mp_get_buffer_raise(args[ARG_buf].u_obj, &rxb, MP_BUFFER_WRITE);
     uint8_t val = (uint8_t)args[ARG_write_val].u_int;
-    if (val != 0) memset(self->zero_buf, val, rx->len);
+    if (val != 0) memset(self->zero_buf, val, rxb.len);
 
     int idx = self->queue_tail;
     memset(&self->trans[idx], 0, sizeof(spi_transaction_t));
-    self->trans[idx].length    = rx->len * 8;
+    self->trans[idx].length    = rxb.len * 8;
     self->trans[idx].tx_buffer = self->zero_buf;
-    self->trans[idx].rx_buffer = rx->items;
+    self->trans[idx].rx_buffer = rxb.buf;
     self->trans[idx].flags     = lane_flag(self->lane_count);
     self->trans[idx].user      = (void *)(uintptr_t)(idx + 1);
     self->ref_bufs[idx] = args[ARG_buf].u_obj;
@@ -335,15 +336,16 @@ static mp_obj_t spi_write_readinto(size_t n_args, const mp_obj_t *pos_args, mp_m
     if (self->queue_count >= SPI_DMA_QUEUE_DEPTH)
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
 
-    mp_obj_array_t *w = (mp_obj_array_t *)args[ARG_wbuf].u_obj;
-    mp_obj_array_t *r = (mp_obj_array_t *)args[ARG_rbuf].u_obj;
-    size_t len = w->len; if (r->len < len) len = r->len;
+    mp_buffer_info_t wbi, rbi;
+    mp_get_buffer_raise(args[ARG_wbuf].u_obj, &wbi, MP_BUFFER_READ);
+    mp_get_buffer_raise(args[ARG_rbuf].u_obj, &rbi, MP_BUFFER_WRITE);
+    size_t len = wbi.len; if (rbi.len < len) len = rbi.len;
 
     int idx = self->queue_tail;
     memset(&self->trans[idx], 0, sizeof(spi_transaction_t));
     self->trans[idx].length    = len * 8;
-    self->trans[idx].tx_buffer = w->items;
-    self->trans[idx].rx_buffer = r->items;
+    self->trans[idx].tx_buffer = wbi.buf;
+    self->trans[idx].rx_buffer = rbi.buf;
     self->trans[idx].flags     = lane_flag(self->lane_count);
     self->trans[idx].user      = (void *)(uintptr_t)(idx + 1);
     self->ref_bufs[idx] = args[ARG_rbuf].u_obj;

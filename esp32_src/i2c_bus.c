@@ -85,9 +85,10 @@ static mp_obj_t i2c_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
     mp_lcd_i2c_bus_obj_t *self = (mp_lcd_i2c_bus_obj_t *)args[ARG_self].u_obj;
-    mp_obj_array_t *a = (mp_obj_array_t *)args[ARG_buf].u_obj;
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(args[ARG_buf].u_obj, &bufinfo, MP_BUFFER_READ);
 
-    esp_err_t ret = esp_lcd_panel_io_tx_color(self->panel_io, -1, a->items, a->len);
+    esp_err_t ret = esp_lcd_panel_io_tx_color(self->panel_io, -1, bufinfo.buf, bufinfo.len);
     if (ret != ESP_OK) {
         mp_raise_msg_varg(&mp_type_RuntimeError,
             MP_ERROR_TEXT("i2c write err=0x%x"), ret);
@@ -108,9 +109,10 @@ static mp_obj_t i2c_readinto(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
     mp_lcd_i2c_bus_obj_t *self = (mp_lcd_i2c_bus_obj_t *)args[ARG_self].u_obj;
-    mp_obj_array_t *a = (mp_obj_array_t *)args[ARG_buf].u_obj;
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(args[ARG_buf].u_obj, &bufinfo, MP_BUFFER_WRITE);
 
-    esp_err_t ret = esp_lcd_panel_io_rx_param(self->panel_io, (int)args[ARG_cmd].u_int, a->items, a->len);
+    esp_err_t ret = esp_lcd_panel_io_rx_param(self->panel_io, (int)args[ARG_cmd].u_int, bufinfo.buf, bufinfo.len);
     if (ret != ESP_OK) {
         mp_raise_msg_varg(&mp_type_RuntimeError,
             MP_ERROR_TEXT("i2c read err=0x%x"), ret);

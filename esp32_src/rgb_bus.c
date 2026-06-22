@@ -184,7 +184,8 @@ static mp_obj_t rgb_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
     mp_lcd_rgb_bus_obj_t *self = (mp_lcd_rgb_bus_obj_t *)args[ARG_self].u_obj;
-    mp_obj_array_t *a = (mp_obj_array_t *)args[ARG_buf].u_obj;
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(args[ARG_buf].u_obj, &bufinfo, MP_BUFFER_READ);
 
     if (self->queue_count >= RGB_DMA_QUEUE_DEPTH)
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
@@ -198,7 +199,7 @@ static mp_obj_t rgb_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     int w = args[ARG_w].u_int ? args[ARG_w].u_int : self->panel_w;
     int h = args[ARG_h].u_int ? args[ARG_h].u_int : self->panel_h;
 
-    if (esp_lcd_panel_draw_bitmap(self->panel_handle, x, y, x + w, y + h, a->items) != ESP_OK) {
+    if (esp_lcd_panel_draw_bitmap(self->panel_handle, x, y, x + w, y + h, bufinfo.buf) != ESP_OK) {
         self->ref_bufs[idx] = mp_const_none;
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("draw_bitmap failed"));
     }
