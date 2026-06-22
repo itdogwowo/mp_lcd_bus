@@ -7,9 +7,8 @@
 
 #include "esp_lcd_panel_rgb.h"
 #include "py/obj.h"
-#include "lcd_bus_config.h"
 
-#define RGB_DMA_QUEUE_DEPTH LCD_BUS_DMA_QUEUE_DEPTH
+#define RGB_DMA_QUEUE_DEPTH 2
 
 typedef struct _mp_lcd_rgb_bus_obj_t {
     mp_obj_base_t base;
