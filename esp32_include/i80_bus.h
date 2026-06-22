@@ -7,8 +7,9 @@
 
 #include "esp_lcd_panel_io.h"
 #include "py/obj.h"
+#include "lcd_bus_config.h"
 
-#define I80_DMA_QUEUE_DEPTH 4
+#define I80_DMA_QUEUE_DEPTH LCD_BUS_DMA_QUEUE_DEPTH
 
 typedef struct _mp_lcd_i80_bus_obj_t {
     mp_obj_base_t base;

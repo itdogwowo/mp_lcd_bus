@@ -3,8 +3,9 @@
 
 #include "driver/spi_master.h"
 #include "py/obj.h"
+#include "lcd_bus_config.h"
 
-#define SPI_DMA_QUEUE_DEPTH 4
+#define SPI_DMA_QUEUE_DEPTH LCD_BUS_DMA_QUEUE_DEPTH
 
 typedef struct _mp_lcd_spi_bus_obj_t {
     mp_obj_base_t base;
