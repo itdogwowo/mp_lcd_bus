@@ -21,7 +21,6 @@ typedef struct _mp_lcd_spi_bus_obj_t {
     int clk_pin;
     int freq;
     int host;
-    int xfer_sz;           // max transfer size per DMA transaction
 
     uint8_t *zero_buf;
 

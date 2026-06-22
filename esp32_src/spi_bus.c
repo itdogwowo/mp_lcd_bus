@@ -27,12 +27,11 @@ static uint32_t lane_flag(int n) {
 static int enqueue(mp_lcd_spi_bus_obj_t *self, const mp_obj_t buf, void *rx) {
     int idx = self->queue_tail;
 
-    mp_buffer_info_t bufinfo;
-    mp_get_buffer_raise(buf, &bufinfo, MP_BUFFER_READ);
+    mp_obj_array_t *a = (mp_obj_array_t *)buf;
 
     memset(&self->trans[idx], 0, sizeof(spi_transaction_t));
-    self->trans[idx].length    = bufinfo.len * 8;
-    self->trans[idx].tx_buffer = bufinfo.buf;
+    self->trans[idx].length    = a->len * 8;
+    self->trans[idx].tx_buffer = a->items;
     self->trans[idx].rx_buffer = rx;
     self->trans[idx].flags     = lane_flag(self->lane_count);
     self->trans[idx].user      = (void *)(uintptr_t)(idx + 1);
@@ -86,7 +85,7 @@ static void spi_deinit_hardware(mp_lcd_spi_bus_obj_t *self) {
 }
 
 static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
-    enum { ARG_data, ARG_clk, ARG_freq, ARG_host, ARG_sck, ARG_mosi, ARG_miso, ARG_xfer_sz };
+    enum { ARG_data, ARG_clk, ARG_freq, ARG_host, ARG_sck, ARG_mosi, ARG_miso };
     static const mp_arg_t allowed[] = {
         { MP_QSTR_data, MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
         { MP_QSTR_clk,  MP_ARG_INT, {.u_int = -1} },
@@ -95,7 +94,6 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         { MP_QSTR_sck,  MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
         { MP_QSTR_mosi, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
         { MP_QSTR_miso, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
-        { MP_QSTR_xfer_sz, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 32768} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed), allowed, args);
@@ -146,7 +144,6 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     self->clk_pin = clk_pin;
     self->freq    = args[ARG_freq].u_int;
     self->host    = host;
-    self->xfer_sz = (int)args[ARG_xfer_sz].u_int;
 
     int miso_pin = -1;
     if (use_data_style) {
@@ -164,10 +161,10 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         s_spi_zero_buf[host] = NULL;
     }
 
-    self->zero_buf = (uint8_t *)heap_caps_calloc(1, 4096, MALLOC_CAP_DMA);
+    self->zero_buf = (uint8_t *)heap_caps_calloc(1, 32768, MALLOC_CAP_DMA);
     if (!self->zero_buf) {
         gc_collect();
-        self->zero_buf = (uint8_t *)heap_caps_calloc(1, 4096, MALLOC_CAP_DMA);
+        self->zero_buf = (uint8_t *)heap_caps_calloc(1, 32768, MALLOC_CAP_DMA);
     }
     if (!self->zero_buf) {
         m_del_obj(mp_lcd_spi_bus_obj_t, self);
@@ -185,7 +182,7 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         .data5_io_num  = self->data_pins[5],
         .data6_io_num  = self->data_pins[6],
         .data7_io_num  = self->data_pins[7],
-        .max_transfer_sz = self->xfer_sz,
+        .max_transfer_sz = 32768,
         .flags          = SPICOMMON_BUSFLAG_MASTER,
     };
 
@@ -382,12 +379,6 @@ static mp_obj_t spi_lane_count(mp_obj_t self_in) {
 static MP_DEFINE_CONST_FUN_OBJ_1(spi_lane_count_obj, spi_lane_count);
 
 
-static mp_obj_t spi_xfer_sz(mp_obj_t self_in) {
-    return mp_obj_new_int(((mp_lcd_spi_bus_obj_t *)self_in)->xfer_sz);
-}
-static MP_DEFINE_CONST_FUN_OBJ_1(spi_xfer_sz_obj, spi_xfer_sz);
-
-
 static mp_obj_t spi_wait(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     enum { ARG_self, ARG_trans_id, ARG_timeout_ms };
     static const mp_arg_t allowed[] = {
@@ -467,7 +458,6 @@ static const mp_rom_map_elem_t spi_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_wait),           MP_ROM_PTR(&spi_wait_obj) },
     { MP_ROM_QSTR(MP_QSTR_wait_all),       MP_ROM_PTR(&spi_wait_all_obj) },
     { MP_ROM_QSTR(MP_QSTR_lane_count),     MP_ROM_PTR(&spi_lane_count_obj) },
-    { MP_ROM_QSTR(MP_QSTR_xfer_sz),        MP_ROM_PTR(&spi_xfer_sz_obj) },
     { MP_ROM_QSTR(MP_QSTR_deinit),         MP_ROM_PTR(&spi_deinit_obj) },
     { MP_ROM_QSTR(MP_QSTR___del__),        MP_ROM_PTR(&spi_deinit_obj) },
 };
