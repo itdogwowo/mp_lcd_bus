@@ -3,6 +3,7 @@
 #include "i2c_bus.h"
 #include "i80_bus.h"
 #include "rgb_bus.h"
+#include "dsi_bus.h"
 
 static const mp_map_elem_t mp_module_lcd_bus_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_OBJ_NEW_QSTR(MP_QSTR_lcd_bus) },
@@ -10,6 +11,7 @@ static const mp_map_elem_t mp_module_lcd_bus_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_I2CBus),   (mp_obj_t)&mp_lcd_i2c_bus_type },
     { MP_ROM_QSTR(MP_QSTR_I80Bus),   (mp_obj_t)&mp_lcd_i80_bus_type },
     { MP_ROM_QSTR(MP_QSTR_RGBBus),   (mp_obj_t)&mp_lcd_rgb_bus_type },
+    { MP_ROM_QSTR(MP_QSTR_DSIBus),   (mp_obj_t)&mp_lcd_dsi_bus_type },
 };
 
 static MP_DEFINE_CONST_DICT(mp_module_lcd_bus_globals, mp_module_lcd_bus_globals_table);

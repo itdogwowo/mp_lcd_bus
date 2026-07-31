@@ -11,28 +11,32 @@ import lcd_bus
 ## Bus Types
 
 | Type | Backend | DMA | Async |
-|---|---|---|---|
+|---|---|---|---|---|
 | `lcd_bus.SPIBus` | `spi_device_queue_trans` | ✅ | ✅ 4-deep |
 | `lcd_bus.I80Bus` | `esp_lcd_i80` | ✅ | ✅ 4-deep |
 | `lcd_bus.RGBBus` | `esp_lcd_rgb` | ✅ | ✅ 2-deep |
+| `lcd_bus.DSIBus` | `esp_lcd_mipi_dsi` (ESP32-P4 only) | ✅ | ✅ 4-deep |
 | `lcd_bus.I2CBus` | `esp_lcd_i2c` | ❌ | ❌ blocking |
 
 ## Unified API
 
 All buses expose the same methods:
 
-| Method | SPI | I2C | I80 | RGB |
-|---|---|---|---|---|
-| `write(buf)` → `trans_id` | ✅ async | ✅ | ✅ async | ✅ async |
-| `write(buf, *, cmd=, addr=, multiline=)` → `None` | ✅ sync | ❌ | ❌ | ❌ |
-| `readinto(buf, write_val=0)` → `trans_id` | ✅ async | ✅ | ❌ | ❌ |
-| `write_readinto(wbuf, rbuf)` → `trans_id` | ✅ async | ❌ | ❌ | ❌ |
-| `is_busy()` → `bool` | ✅ | ✅ | ✅ | ✅ |
-| `pending()` → `int` | ✅ | ✅ | ✅ | ✅ |
-| `wait(trans_id, timeout_ms=-1)` → `bool` | ✅ | ✅ | ✅ | ✅ |
-| `wait_all(timeout_ms=-1)` → `None` | ✅ | ✅ | ✅ | ✅ |
-| `lane_count()` → `int` | ✅ | ✅ | ✅ | ✅ |
-| `deinit()` | ✅ | ✅ | ✅ | ✅ |
+| Method | SPI | I2C | I80 | RGB | DSI |
+|---|---|---|---|---|---|
+| `write(buf)` → `trans_id` | ✅ async | ✅ | ✅ async | ✅ async | ✅ async |
+| `write(buf, *, cmd=, addr=, multiline=)` → `None` | ✅ sync | ❌ | ❌ | ❌ | ❌ |
+| `readinto(buf, write_val=0)` → `trans_id` | ✅ async | ✅ | ❌ | ❌ | ❌ |
+| `write_readinto(wbuf, rbuf)` → `trans_id` | ✅ async | ❌ | ❌ | ❌ | ❌ |
+| `cmd(cmd, param=b'')` → `None` | ❌ | ❌ | ❌ | ❌ | ✅ sync |
+| `is_busy()` → `bool` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `pending()` → `int` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `wait(trans_id, timeout_ms=-1)` → `bool` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `wait_all(timeout_ms=-1)` → `None` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `lane_count()` → `int` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `frame_buffer(idx)` → `bytearray` | ❌ | ❌ | ❌ | ❌ | ✅ |
+| `set_pattern(pat)` | ❌ | ❌ | ❌ | ❌ | ✅ |
+| `deinit()` | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ## Constructors
 
@@ -92,6 +96,50 @@ lcd_bus.RGBBus(data, hsync, vsync, de, pclk, width, height, *,
                de_idle_high=False, pclk_idle_high=False,
                pclk_active_neg=False, disp_active_low=False,
                refresh_on_demand=False, bb_size_px=0)
+```
+
+### DSIBus (ESP32-P4 only)
+
+```python
+lcd_bus.DSIBus(lanes, width, height, lane_bit_rate_mbps, *,
+               dpi_clk_mhz=30.0,
+               hsync_pulse_width=1, hsync_back_porch=10, hsync_front_porch=10,
+               vsync_pulse_width=1, vsync_back_porch=10, vsync_front_porch=10,
+               in_color_format=16, fb_count=2, reset_pin=-1,
+               virtual_channel=0)
+```
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `lanes` | int | required | Number of MIPI DSI data lanes (1-4) |
+| `width`, `height` | int | required | Panel resolution |
+| `lane_bit_rate_mbps` | float | required | DSI PHY lane bit rate in Mbps (e.g. 1000) |
+| `dpi_clk_mhz` | float | 30.0 | Pixel clock (DPI) frequency in MHz |
+| `hsync/vsync_*` | int | 1/10/10 | Video timing (porches & pulse width, in px/lines) |
+| `in_color_format` | int | 16 | `16` = RGB565, `24` = RGB888 |
+| `fb_count` | int | 2 | Number of internal frame buffers (1-3), allocated in PSRAM by the driver |
+| `reset_pin` | int | -1 | Panel hardware reset GPIO (`-1` = not used) |
+| `virtual_channel` | int | 0 | DSI virtual channel (0-3) |
+
+The driver allocates screen-sized frame buffers internally; `frame_buffer(idx)` returns a zero-copy `bytearray` view of one. Writes are asynchronous — the bus copies the buffer into a frame buffer, and `write()` returns a `trans_id` you can `wait()` on:
+
+```python
+bus = lcd_bus.DSIBus(lanes=2, width=800, height=480,
+                     lane_bit_rate_mbps=1000, reset_pin=20)
+
+bus.cmd(0x11)                    # SLPOUT (no params)
+bus.cmd(0x36, b'\x00')           # MADCTL
+bus.cmd(0x3A, b'\x70')           # COLMOD RGB565
+bus.cmd(0x29)                    # DISPON
+
+tid = bus.write(fb_bytes)        # async copy into frame buffer
+bus.wait(tid)
+
+fb = bus.frame_buffer(0)         # zero-copy view of internal fb
+memoryview(fb)[:2] = b'\xf8\x00' # draw directly into the framebuffer
+
+bus.set_pattern(1)               # built-in test pattern (0=none,1=ver bar,2=hor bar,3=BER)
+bus.set_pattern(0)               # back to normal
 ```
 
 ---
@@ -275,6 +323,11 @@ Test suite (7 areas, 23 assertions):
 ## Build
 
 CMake-based (ESP-IDF): add this repo as a User C Module.
+
+`DSIBus` is compiled into every ESP32 build, but the real MIPI DSI driver code inside
+`esp32_src/dsi_bus.c` is guarded by `#if SOC_MIPI_DSI_SUPPORTED`, which is only defined
+on the ESP32-P4. On other ESP32 chips (e.g. ESP32-S3) it compiles down to a stub that
+raises `NotImplementedError`, so no per-chip build configuration is needed.
 
 Non-ESP32 ports: stubs raise `NotImplementedError`.
 

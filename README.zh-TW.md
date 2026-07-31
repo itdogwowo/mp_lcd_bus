@@ -15,24 +15,28 @@ import lcd_bus
 | `lcd_bus.SPIBus` | `spi_device_queue_trans` | ✅ | ✅ 4 層隊列 |
 | `lcd_bus.I80Bus` | `esp_lcd_i80` | ✅ | ✅ 4 層隊列 |
 | `lcd_bus.RGBBus` | `esp_lcd_rgb` | ✅ | ✅ 2 層隊列 |
+| `lcd_bus.DSIBus` | `esp_lcd_mipi_dsi`（僅 ESP32-P4） | ✅ | ✅ 4 層隊列 |
 | `lcd_bus.I2CBus` | `esp_lcd_i2c` | ❌ | ❌ 阻塞式 |
 
 ## 統一 API
 
 所有 bus 共用相同方法：
 
-| 方法 | SPI | I2C | I80 | RGB |
-|---|---|---|---|---|
-| `write(buf)` → `trans_id` | ✅ 非同步 | ✅ | ✅ 非同步 | ✅ 非同步 |
-| `write(buf, *, cmd=, addr=, multiline=)` → `None` | ✅ 同步 | ❌ | ❌ | ❌ |
-| `readinto(buf, write_val=0)` → `trans_id` | ✅ 非同步 | ✅ | ❌ | ❌ |
-| `write_readinto(wbuf, rbuf)` → `trans_id` | ✅ 非同步 | ❌ | ❌ | ❌ |
-| `is_busy()` → `bool` | ✅ | ✅ | ✅ | ✅ |
-| `pending()` → `int` | ✅ | ✅ | ✅ | ✅ |
-| `wait(trans_id, timeout_ms=-1)` → `bool` | ✅ | ✅ | ✅ | ✅ |
-| `wait_all(timeout_ms=-1)` → `None` | ✅ | ✅ | ✅ | ✅ |
-| `lane_count()` → `int` | ✅ | ✅ | ✅ | ✅ |
-| `deinit()` | ✅ | ✅ | ✅ | ✅ |
+| 方法 | SPI | I2C | I80 | RGB | DSI |
+|---|---|---|---|---|---|
+| `write(buf)` → `trans_id` | ✅ 非同步 | ✅ | ✅ 非同步 | ✅ 非同步 | ✅ 非同步 |
+| `write(buf, *, cmd=, addr=, multiline=)` → `None` | ✅ 同步 | ❌ | ❌ | ❌ | ❌ |
+| `readinto(buf, write_val=0)` → `trans_id` | ✅ 非同步 | ✅ | ❌ | ❌ | ❌ |
+| `write_readinto(wbuf, rbuf)` → `trans_id` | ✅ 非同步 | ❌ | ❌ | ❌ | ❌ |
+| `cmd(cmd, param=b'')` → `None` | ❌ | ❌ | ❌ | ❌ | ✅ 同步 |
+| `is_busy()` → `bool` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `pending()` → `int` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `wait(trans_id, timeout_ms=-1)` → `bool` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `wait_all(timeout_ms=-1)` → `None` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `lane_count()` → `int` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `frame_buffer(idx)` → `bytearray` | ❌ | ❌ | ❌ | ❌ | ✅ |
+| `set_pattern(pat)` | ❌ | ❌ | ❌ | ❌ | ✅ |
+| `deinit()` | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ## 建構子
 
@@ -83,6 +87,52 @@ bus = lcd_bus.I80Bus(data=(d0..d15), wr=10)                    # 16-bit
 ```python
 lcd_bus.RGBBus(data, hsync, vsync, de, pclk, width, height, *,
                freq=8_000_000, disp=-1, ...)
+```
+
+### DSIBus（僅 ESP32-P4）
+
+```python
+lcd_bus.DSIBus(lanes, width, height, lane_bit_rate_mbps, *,
+               dpi_clk_mhz=30.0,
+               hsync_pulse_width=1, hsync_back_porch=10, hsync_front_porch=10,
+               vsync_pulse_width=1, vsync_back_porch=10, vsync_front_porch=10,
+               in_color_format=16, fb_count=2, reset_pin=-1,
+               virtual_channel=0)
+```
+
+| 參數 | 類型 | 預設 | 說明 |
+|------|------|------|------|
+| `lanes` | int | 必填 | MIPI DSI data lane 數（1-4） |
+| `width`, `height` | int | 必填 | 面板解析度 |
+| `lane_bit_rate_mbps` | float | 必填 | DSI PHY lane bit rate（Mbps，如 1000） |
+| `dpi_clk_mhz` | float | 30.0 | 像素（DPI）時脈 MHz |
+| `hsync/vsync_*` | int | 1/10/10 | video timing（porch 與 pulse width，單位 px/行） |
+| `in_color_format` | int | 16 | `16` = RGB565，`24` = RGB888 |
+| `fb_count` | int | 2 | 內部 frame buffer 數（1-3），由 driver 配置於 PSRAM |
+| `reset_pin` | int | -1 | 面板硬體 reset GPIO（`-1` = 不使用） |
+| `virtual_channel` | int | 0 | DSI virtual channel（0-3） |
+
+driver 內部自動配置整張畫面的 frame buffer；`frame_buffer(idx)` 回傳零拷貝的
+`bytearray` 視圖。`write()` 是非同步的——bus 會把資料複製進 frame buffer，
+回傳 `trans_id` 可搭配 `wait()`：
+
+```python
+bus = lcd_bus.DSIBus(lanes=2, width=800, height=480,
+                     lane_bit_rate_mbps=1000, reset_pin=20)
+
+bus.cmd(0x11)                    # SLPOUT（無參數）
+bus.cmd(0x36, b'\x00')           # MADCTL
+bus.cmd(0x3A, b'\x70')           # COLMOD RGB565
+bus.cmd(0x29)                    # DISPON
+
+tid = bus.write(fb_bytes)        # 非同步複製進 frame buffer
+bus.wait(tid)
+
+fb = bus.frame_buffer(0)         # 內部 fb 的零拷貝視圖
+memoryview(fb)[:2] = b'\xf8\x00' # 直接寫進 framebuffer
+
+bus.set_pattern(1)               # 內建測試圖案（0=無,1=直條,2=橫條,3=BER）
+bus.set_pattern(0)               # 恢復正常顯示
 ```
 
 ---
@@ -263,6 +313,11 @@ test_bus.run_all()
 ## 建置
 
 CMake（ESP-IDF）：將本 repo 加入為 User C Module。
+
+`DSIBus` 在每個 ESP32 建置都會編譯，但 `esp32_src/dsi_bus.c` 內的真正 MIPI DSI
+驅動程式碼由 `#if SOC_MIPI_DSI_SUPPORTED` 保護——該巨集只有在 ESP32-P4 上才定義。
+其他 ESP32（如 ESP32-S3）會編譯成拋出 `NotImplementedError` 的 stub，因此不需要
+針對晶片修改建置設定（自動分流）。
 
 非 ESP32：stub 拋 `NotImplementedError`。
 
