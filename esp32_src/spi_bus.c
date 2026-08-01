@@ -539,15 +539,18 @@ static mp_obj_t spi_wait_all(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
             self->queue_count--;
         }
     }
-    // ⚠ 修復：逾時後強制釋放殘留 queue 的 buffer 引用（對齊 I80 bus 行為），
+    // 逾時後強制釋放殘留 queue 的 buffer 引用（對齊 I80 bus 行為），
     // 避免 ref_bufs 永遠釘住 → GC 卡死。DMA 可能仍在飛，caller 不應重用這些 buffer。
+    // ⚠ 僅在此路徑（queue 有殘留）才 gc_collect()：正常 drain 完畢（queue 已空）
+    // 不需要立即 GC — 每幀 flush 都會呼叫 wait_all，full GC 在 PSRAM heap + 大
+    // frame buffer 上可達 ~200ms（實測），是 120ms/幀 的主因。
     if (self->queue_count > 0) {
         for (int i = 0; i < SPI_DMA_QUEUE_DEPTH; i++) {
             self->ref_bufs[i] = mp_const_none;
         }
         self->queue_count = 0;
+        gc_collect();
     }
-    gc_collect();
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(spi_wait_all_obj, 1, spi_wait_all);

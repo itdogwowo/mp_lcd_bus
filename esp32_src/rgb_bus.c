@@ -275,7 +275,17 @@ static mp_obj_t rgb_wait_all(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
         if (to >= 0 && mp_hal_ticks_ms() > deadline) break;
         mp_hal_delay_ms(1);
     }
-    gc_collect();
+    // ⚠ 效能修復（同 spi_bus）：正常 drain 完畢不需立即 GC — 每幀 flush 都會呼叫
+    // wait_all，full GC 在 PSRAM heap + 大 frame buffer 上可達 ~200ms（實測），
+    // 是「每幀慢 200ms」的主因。僅在逾時殘留（queue 未清空）時才強制釋放 + gc_collect。
+    if (self->queue_count > 0) {
+        for (int i = 0; i < RGB_DMA_QUEUE_DEPTH; i++) {
+            self->ref_bufs[i] = mp_const_none;
+            self->done_flags[i] = true;
+        }
+        self->queue_head = self->queue_tail = self->queue_count = 0;
+        gc_collect();
+    }
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(rgb_wait_all_obj, 1, rgb_wait_all);

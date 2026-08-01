@@ -218,6 +218,10 @@ static mp_obj_t dsi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     mp_buffer_info_t bufinfo;
     mp_get_buffer_raise(args[ARG_buf].u_obj, &bufinfo, MP_BUFFER_READ);
 
+    // ⚠ deinit 後 dpi_panel 為 NULL，直接使用會 use-after-free
+    if (self->dpi_panel == NULL) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("bus deinitialized"));
+    }
     if (self->queue_count >= DSI_DMA_QUEUE_DEPTH)
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
 
@@ -257,6 +261,11 @@ static mp_obj_t dsi_cmd(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_ar
 
     mp_lcd_dsi_bus_obj_t *self = (mp_lcd_dsi_bus_obj_t *)args[ARG_self].u_obj;
 
+    // ⚠ deinit 後 dbi_io 為 NULL，直接使用會 use-after-free
+    if (self->dbi_io == NULL) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("bus deinitialized"));
+    }
+
     const void *param = NULL;
     size_t param_size = 0;
     if (args[ARG_param].u_obj != MP_OBJ_NULL) {
@@ -276,6 +285,10 @@ static MP_DEFINE_CONST_FUN_OBJ_KW(dsi_cmd_obj, 2, dsi_cmd);
 
 static mp_obj_t dsi_set_pattern(mp_obj_t self_in, mp_obj_t pat_in) {
     mp_lcd_dsi_bus_obj_t *self = (mp_lcd_dsi_bus_obj_t *)self_in;
+    // ⚠ deinit 後 dpi_panel 為 NULL，直接使用會 use-after-free
+    if (self->dpi_panel == NULL) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("bus deinitialized"));
+    }
     int pat = mp_obj_get_int(pat_in);
     if (pat < 0 || pat > 3)
         mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("pattern must be 0-3"));
@@ -358,7 +371,17 @@ static mp_obj_t dsi_wait_all(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
         if (to >= 0 && mp_hal_ticks_ms() > deadline) break;
         mp_hal_delay_ms(1);
     }
-    gc_collect();
+    // ⚠ 效能修復（同 spi_bus/rgb_bus）：正常 drain 完畢不需立即 GC —
+    // 每幀 flush 都會呼叫 wait_all，full GC 在 PSRAM heap + 大 frame buffer
+    // 上可達 ~200ms。僅在逾時殘留（queue 未清空）時才強制釋放 + gc_collect。
+    if (self->queue_count > 0) {
+        for (int i = 0; i < DSI_DMA_QUEUE_DEPTH; i++) {
+            self->ref_bufs[i] = mp_const_none;
+            self->done_flags[i] = true;
+        }
+        self->queue_head = self->queue_tail = self->queue_count = 0;
+        gc_collect();
+    }
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(dsi_wait_all_obj, 1, dsi_wait_all);
