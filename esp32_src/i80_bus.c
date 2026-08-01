@@ -13,6 +13,9 @@
 #include "py/gc.h"
 #include "soc/gpio_sig_map.h"
 #include "esp_rom_gpio.h"
+
+// I80 單筆傳輸上限（max_transfer_bytes）— 超過需分 chunk
+#define I80_MAX_CHUNK 32768
 #include "driver/gpio.h"
 
 #include <string.h>
@@ -29,6 +32,8 @@ static bool on_color_done(esp_lcd_panel_io_handle_t panel_io,
     for (int i = 0; i < I80_DMA_QUEUE_DEPTH; i++) {
         if (self->pending[i]) {
             self->pending[i] = false;
+            // ⚠ 修復：釋放 buffer 引用（DMA 已讀完，可安全回收）
+            self->ref_bufs[i] = mp_const_none;
             self->queue_head = (self->queue_head + 1) % I80_DMA_QUEUE_DEPTH;
             self->queue_count--;
             break;
@@ -118,6 +123,7 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     }
 
     memset(self->pending, 0, sizeof(self->pending));
+    for (int i = 0; i < I80_DMA_QUEUE_DEPTH; i++) self->ref_bufs[i] = mp_const_none;
     self->queue_head = self->queue_tail = self->queue_count = 0;
     self->initialized = true;
 
@@ -142,13 +148,11 @@ static mp_obj_t i80_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     mp_lcd_i80_bus_obj_t *self = (mp_lcd_i80_bus_obj_t *)args[ARG_self].u_obj;
     int cmd = args[ARG_cmd].u_int;
 
-    if (self->queue_count >= I80_DMA_QUEUE_DEPTH)
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
-
-    int idx = self->queue_tail;
-
     if (args[ARG_buf].u_obj == MP_OBJ_NULL) {
         // 純指令：用 tx_param 才能確保 DC=0（跟 LVGL 實作一致）
+        if (self->panel_io == NULL) {
+            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("bus deinitialized"));
+        }
         if (esp_lcd_panel_io_tx_param(self->panel_io, cmd, NULL, 0) != ESP_OK)
             mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_param failed"));
         return mp_const_none;
@@ -156,20 +160,52 @@ static mp_obj_t i80_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
 
     mp_buffer_info_t bufinfo;
     mp_get_buffer_raise(args[ARG_buf].u_obj, &bufinfo, MP_BUFFER_READ);
-    self->pending[idx] = true;
 
-    // DMA 直接從 Python buffer——caller 持有引用，不會被 GC 回收
-    if (esp_lcd_panel_io_tx_color(self->panel_io, cmd, bufinfo.buf, bufinfo.len) != ESP_OK) {
-        self->pending[idx] = false;
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_color failed"));
+    // ══════════════════════════════════════════════════════════════
+    // 性能全修：單筆 >32KB（max_transfer_bytes）自動分 chunk。
+    // 每 chunk 用 tx_color 入隊；queue 滿時等 on_color_done 回呼讓出槽位。
+    // 單筆（不分 chunk）維持「queue 滿立即 raise」的相容語意。
+    // ══════════════════════════════════════════════════════════════
+    bool single = (bufinfo.len <= I80_MAX_CHUNK);
+    if (single && self->queue_count >= I80_DMA_QUEUE_DEPTH)
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
+
+    if (self->panel_io == NULL) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("bus deinitialized"));
     }
 
-    self->queue_tail = (self->queue_tail + 1) % I80_DMA_QUEUE_DEPTH;
-    self->queue_count++;
+    uint8_t *src = (uint8_t *)bufinfo.buf;
+    size_t rem = bufinfo.len;
+    int first_tid = -1;
+    int cur_tid = -1;
 
+    while (rem > 0) {
+        size_t n = rem > I80_MAX_CHUNK ? I80_MAX_CHUNK : rem;
 
+        // 等一個空槽（on_color_done 回呼會遞減 queue_count）
+        while (self->queue_count >= I80_DMA_QUEUE_DEPTH) {
+            mp_hal_delay_ms(1);
+        }
 
-    return mp_obj_new_int(idx + 1);
+        int slot = self->queue_tail;
+        self->pending[slot] = true;
+        self->ref_bufs[slot] = args[ARG_buf].u_obj;  // 整個 obj 一路保護
+
+        if (esp_lcd_panel_io_tx_color(self->panel_io, cmd, src, n) != ESP_OK) {
+            self->pending[slot] = false;
+            self->ref_bufs[slot] = mp_const_none;
+            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_color failed"));
+        }
+
+        self->queue_tail = (self->queue_tail + 1) % I80_DMA_QUEUE_DEPTH;
+        self->queue_count++;
+        cur_tid = slot + 1;
+        if (first_tid < 0) first_tid = cur_tid;  // 回傳第一個 chunk tid（FIFO wait 等到底）
+        src += n;
+        rem -= n;
+    }
+
+    return mp_obj_new_int(first_tid);
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(i80_write_obj, 1, i80_write);
 
@@ -237,7 +273,10 @@ static mp_obj_t i80_wait_all(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
     while (self->queue_count > 0) {
         if (mp_hal_ticks_ms() > deadline) {
             // timeout: DMA 不回呼，強制清空 queue 避免卡死
-            for (int i = 0; i < I80_DMA_QUEUE_DEPTH; i++) self->pending[i] = false;
+            for (int i = 0; i < I80_DMA_QUEUE_DEPTH; i++) {
+                self->pending[i] = false;
+                self->ref_bufs[i] = mp_const_none;  // ⚠ 同步釋放引用
+            }
             self->queue_head = self->queue_tail = self->queue_count = 0;
             return mp_const_false;
         }
@@ -287,6 +326,7 @@ static mp_obj_t i80_deinit(mp_obj_t self_in) {
     // 釋放 DMA buffer references
     for (int i = 0; i < I80_DMA_QUEUE_DEPTH; i++) {
         self->pending[i] = false;
+        self->ref_bufs[i] = mp_const_none;  // ⚠ 同步釋放引用
     }
     self->queue_head = self->queue_tail = self->queue_count = 0;
 

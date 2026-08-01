@@ -190,11 +190,12 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     return MP_OBJ_FROM_PTR(self);
 
 err_panel:
-    esp_lcd_panel_del(self->dpi_panel);
+    if (self->dpi_panel) esp_lcd_panel_del(self->dpi_panel);
 err_io:
-    esp_lcd_panel_io_del(self->dbi_io);
+    if (self->dbi_io) esp_lcd_panel_io_del(self->dbi_io);
 err_bus:
-    esp_lcd_del_dsi_bus(self->bus_handle);
+    // ⚠ 修復：esp_lcd_new_dsi_bus 失敗時 bus_handle 為 NULL，直接 del 會 assert/crash
+    if (self->bus_handle) esp_lcd_del_dsi_bus(self->bus_handle);
     m_del_obj(mp_lcd_dsi_bus_obj_t, self);
     mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("DSI init failed err=0x%x"), ret);
 }
@@ -367,6 +368,12 @@ static mp_obj_t dsi_deinit(mp_obj_t self_in) {
     mp_lcd_dsi_bus_obj_t *self = (mp_lcd_dsi_bus_obj_t *)self_in;
     if (s_last_dsi == self) s_last_dsi = NULL;
     dsi_deinit_hardware(self);
+    // ⚠ 修復：清 ref_bufs（原先殘留釘住 buffer 引用 → GC 洩漏）
+    for (int i = 0; i < DSI_DMA_QUEUE_DEPTH; i++) {
+        self->ref_bufs[i] = mp_const_none;
+        self->done_flags[i] = true;
+    }
+    self->queue_count = 0;
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(dsi_deinit_obj, dsi_deinit);

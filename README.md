@@ -12,7 +12,7 @@ import lcd_bus
 
 | Type | Backend | DMA | Async |
 |---|---|---|---|---|
-| `lcd_bus.SPIBus` | `spi_device_queue_trans` | ✅ | ✅ 4-deep |
+| `lcd_bus.SPIBus` | `spi_device_queue_trans` | ✅ | ✅ 8-deep |
 | `lcd_bus.I80Bus` | `esp_lcd_i80` | ✅ | ✅ 4-deep |
 | `lcd_bus.RGBBus` | `esp_lcd_rgb` | ✅ | ✅ 2-deep |
 | `lcd_bus.DSIBus` | `esp_lcd_mipi_dsi` (ESP32-P4 only) | ✅ | ✅ 4-deep |
@@ -249,11 +249,11 @@ bus.wait(tid_b)
 
 ### Queue Full
 
-5th write raises `RuntimeError("queue full")` immediately (does not block):
+9th write raises `RuntimeError("queue full")` immediately (does not block) — depth 8:
 
 ```python
 try:
-    for _ in range(5):
+    for _ in range(9):
         bus.write(bytearray(64))
 except RuntimeError as e:
     print(e)  # "queue full"
@@ -261,7 +261,7 @@ except RuntimeError as e:
 
 ### Queue Depth
 
-`SPI_DMA_QUEUE_DEPTH = 4` is not a hardware DMA limit — it's a memory optimization (~28 bytes/slot). Adjust in `esp32_include/spi_bus.h`. 4 is sufficient for the common `write → wait` serial pattern.
+`SPI_DMA_QUEUE_DEPTH = 8` is not a hardware DMA limit — it's a memory optimization (~28 bytes/slot). Adjust in `esp32_include/spi_bus.h`. 8 is sufficient for the common `write → wait` serial pattern.
 
 ### Non-blocking Check
 

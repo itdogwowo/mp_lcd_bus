@@ -7,6 +7,7 @@
 #include "esp_heap_caps.h"
 #include "soc/soc_caps.h"
 #include "soc/gpio_sig_map.h"
+#include "soc/soc.h"
 #include "esp_rom_gpio.h"
 #include "driver/gpio.h"
 
@@ -14,6 +15,9 @@
 
 static spi_device_handle_t  s_spi_device[SOC_SPI_PERIPH_NUM];
 static uint8_t             *s_spi_zero_buf[SOC_SPI_PERIPH_NUM];
+
+// SPI 單筆 DMA 上限（max_transfer_sz）— 超過需分 chunk
+#define SPI_MAX_CHUNK 32768
 
 static uint32_t lane_flag(int n) {
     switch (n) {
@@ -24,29 +28,75 @@ static uint32_t lane_flag(int n) {
     }
 }
 
-static int enqueue(mp_lcd_spi_bus_obj_t *self, const mp_obj_t buf, void *rx) {
-    int idx = self->queue_tail;
-    mp_buffer_info_t bufinfo;
-    mp_get_buffer_raise(buf, &bufinfo, MP_BUFFER_READ);
+// 判斷 buffer 是否在內部 DRAM（DMA 可直接讀）。
+// 外部 PSRAM buffer 不在此範圍 → 需先 copy 進內部 DMA buffer。
+static bool buf_is_internal(const void *p) {
+    uintptr_t a = (uintptr_t)p;
+    return (a >= (uintptr_t)SOC_DRAM_LOW && a < (uintptr_t)SOC_DRAM_HIGH);
+}
 
+// 直接 enqueue 一個裸指標 buffer（data 不一定是 mp_obj，ref 負責 GC 保護；
+// zero_buf 傳 mp_const_none 表示不需 GC 保護）。
+static int enqueue_raw(mp_lcd_spi_bus_obj_t *self, const void *data, size_t len, void *rx, mp_obj_t ref) {
+    if (self->handle == NULL) {
+        return -((int)ESP_ERR_INVALID_STATE);
+    }
+    if (self->queue_count >= SPI_DMA_QUEUE_DEPTH) {
+        return -((int)ESP_ERR_INVALID_STATE);
+    }
+    int idx = self->queue_tail;
     memset(&self->trans[idx], 0, sizeof(spi_transaction_t));
-    self->trans[idx].length    = bufinfo.len * 8;
-    self->trans[idx].tx_buffer = bufinfo.buf;
+    self->trans[idx].length    = len * 8;
+    self->trans[idx].tx_buffer = data;
     self->trans[idx].rx_buffer = rx;
     self->trans[idx].flags     = lane_flag(self->lane_count);
     self->trans[idx].user      = (void *)(uintptr_t)(idx + 1);
-
-    self->ref_bufs[idx] = buf;
+    self->ref_bufs[idx] = ref;
 
     esp_err_t ret = spi_device_queue_trans(self->handle, &self->trans[idx], 0);
     if (ret != ESP_OK) {
         self->ref_bufs[idx] = mp_const_none;
         return -((int)ret);
     }
-
     self->queue_tail = (self->queue_tail + 1) % SPI_DMA_QUEUE_DEPTH;
     self->queue_count++;
     return idx + 1;
+}
+
+// 等 queue 空出至少一個槽（阻塞）。大 buffer 分 chunk 時用。
+static void spi_wait_free_slot(mp_lcd_spi_bus_obj_t *self) {
+    while (self->queue_count >= SPI_DMA_QUEUE_DEPTH) {
+        spi_transaction_t *rt;
+        if (spi_device_get_trans_result(self->handle, &rt, portMAX_DELAY) != ESP_OK) break;
+        int done = (int)(uintptr_t)rt->user - 1;
+        if (done >= 0 && done < SPI_DMA_QUEUE_DEPTH) {
+            self->ref_bufs[done] = mp_const_none;
+            self->queue_count--;
+        }
+    }
+}
+
+// 等 queue 完全清空（阻塞）。PSRAM copy 路徑重用 zero_buf 前用。
+static void spi_wait_queue_empty(mp_lcd_spi_bus_obj_t *self) {
+    while (self->queue_count > 0) {
+        spi_transaction_t *rt;
+        if (spi_device_get_trans_result(self->handle, &rt, portMAX_DELAY) != ESP_OK) break;
+        int done = (int)(uintptr_t)rt->user - 1;
+        if (done >= 0 && done < SPI_DMA_QUEUE_DEPTH) {
+            self->ref_bufs[done] = mp_const_none;
+            self->queue_count--;
+        }
+    }
+}
+
+static int enqueue(mp_lcd_spi_bus_obj_t *self, const mp_obj_t buf, void *rx) {
+    // ⚠ 修復：deinit 後 handle 為 NULL，直接報錯避免 use-after-free
+    if (self->handle == NULL) {
+        return -((int)ESP_ERR_INVALID_STATE);
+    }
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(buf, &bufinfo, MP_BUFFER_READ);
+    return enqueue_raw(self, bufinfo.buf, bufinfo.len, rx, buf);
 }
 
 static void spi_drain_pending(mp_lcd_spi_bus_obj_t *self) {
@@ -82,6 +132,8 @@ static void spi_deinit_hardware(mp_lcd_spi_bus_obj_t *self) {
     if (self->zero_buf) { heap_caps_free(self->zero_buf); self->zero_buf = NULL; }
     if (self->host < SOC_SPI_PERIPH_NUM) s_spi_zero_buf[self->host] = NULL;
     self->initialized = false;
+    // ⚠ 修復：deinit 後 handle 必須清 NULL，避免後續 write() 用 stale handle → UB
+    self->handle = NULL;
 }
 
 static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
@@ -265,15 +317,62 @@ static mp_obj_t spi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
         return mp_const_none;
     }
 
-    if (self->queue_count >= SPI_DMA_QUEUE_DEPTH)
+    // ══════════════════════════════════════════════════════════════
+    // 性能全修：單筆 >32KB 自動分 chunk；非 DMA buffer（PSRAM）自動 copy。
+    // 單筆（≤32KB 且內部 RAM）維持「queue 滿立即 raise」相容語意。
+    // ══════════════════════════════════════════════════════════════
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(args[ARG_buf].u_obj, &bufinfo, MP_BUFFER_READ);
+
+    bool single = (bufinfo.len <= SPI_MAX_CHUNK && buf_is_internal(bufinfo.buf));
+    if (single && self->queue_count >= SPI_DMA_QUEUE_DEPTH)
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
 
-    int tid = enqueue(self, args[ARG_buf].u_obj, NULL);
-    if (tid < 0) {
-        mp_raise_msg_varg(&mp_type_RuntimeError,
-            MP_ERROR_TEXT("queue failed err=0x%x"), -tid);
+    if (single) {
+        int tid = enqueue(self, args[ARG_buf].u_obj, NULL);
+        if (tid < 0) {
+            mp_raise_msg_varg(&mp_type_RuntimeError,
+                MP_ERROR_TEXT("queue failed err=0x%x"), -tid);
+        }
+        return mp_obj_new_int(tid);
     }
-    return mp_obj_new_int(tid);
+
+    // ── 大 buffer 或非 DMA buffer：分 chunk 處理 ──
+    uint8_t *src = (uint8_t *)bufinfo.buf;
+    size_t rem = bufinfo.len;
+    int last_tid = -1;
+    bool is_internal = buf_is_internal(bufinfo.buf);
+
+    while (rem > 0) {
+        size_t n = rem > SPI_MAX_CHUNK ? SPI_MAX_CHUNK : rem;
+
+        if (!is_internal) {
+            // 非 DMA（PSRAM）→ copy 進 zero_buf 再送。
+            // 必須先等 queue 清空，才能安全重用 zero_buf（避免並行覆蓋）。
+            spi_wait_queue_empty(self);
+            memcpy(self->zero_buf, src, n);
+            int tid = enqueue_raw(self, self->zero_buf, n, NULL, mp_const_none);
+            if (tid < 0) {
+                mp_raise_msg_varg(&mp_type_RuntimeError,
+                    MP_ERROR_TEXT("queue failed err=0x%x"), -tid);
+            }
+            last_tid = tid;
+            // 同步：等這筆完成，才能重用 zero_buf
+            spi_wait_queue_empty(self);
+        } else {
+            // 內部 RAM 大 buffer → async 分 chunk（ref 指向同一 obj，GC-safe）
+            spi_wait_free_slot(self);
+            int tid = enqueue_raw(self, src, n, NULL, args[ARG_buf].u_obj);
+            if (tid < 0) {
+                mp_raise_msg_varg(&mp_type_RuntimeError,
+                    MP_ERROR_TEXT("queue failed err=0x%x"), -tid);
+            }
+            last_tid = tid;
+        }
+        src += n;
+        rem -= n;
+    }
+    return mp_obj_new_int(last_tid);
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(spi_write_obj, 2, spi_write);
 
@@ -298,7 +397,11 @@ static mp_obj_t spi_readinto(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
     mp_buffer_info_t rxb;
     mp_get_buffer_raise(args[ARG_buf].u_obj, &rxb, MP_BUFFER_WRITE);
     uint8_t val = (uint8_t)args[ARG_write_val].u_int;
-    if (val != 0) memset(self->zero_buf, val, rxb.len);
+    // ⚠ 修復：每次 readinto 都 memset zero_buf（原先只對 val!=0 做，殘留上次的 0xAA 會被當 0 發出）
+    // 並 clamp 長度，避免溢位（zero_buf 固定 32KB）
+    size_t zero_len = rxb.len;
+    if (zero_len > 32768) zero_len = 32768;
+    memset(self->zero_buf, val, zero_len);
 
     int idx = self->queue_tail;
     memset(&self->trans[idx], 0, sizeof(spi_transaction_t));
@@ -435,6 +538,14 @@ static mp_obj_t spi_wait_all(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
             self->ref_bufs[done] = mp_const_none;
             self->queue_count--;
         }
+    }
+    // ⚠ 修復：逾時後強制釋放殘留 queue 的 buffer 引用（對齊 I80 bus 行為），
+    // 避免 ref_bufs 永遠釘住 → GC 卡死。DMA 可能仍在飛，caller 不應重用這些 buffer。
+    if (self->queue_count > 0) {
+        for (int i = 0; i < SPI_DMA_QUEUE_DEPTH; i++) {
+            self->ref_bufs[i] = mp_const_none;
+        }
+        self->queue_count = 0;
     }
     gc_collect();
     return mp_const_none;

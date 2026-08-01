@@ -16,7 +16,8 @@ typedef struct _mp_lcd_i80_bus_obj_t {
     esp_lcd_i80_bus_handle_t bus_handle;
     esp_lcd_panel_io_handle_t panel_io;
 
-    bool pending[I80_DMA_QUEUE_DEPTH];  // DMA 完成旗標
+    bool pending[I80_DMA_QUEUE_DEPTH];      // DMA 完成旗標
+    mp_obj_t ref_bufs[I80_DMA_QUEUE_DEPTH]; // ⚠ 持有 Python buffer 引用（防 DMA 讀取中被 GC 回收）
     int queue_head, queue_tail, queue_count;
 
     int lane_count;
@@ -24,7 +25,6 @@ typedef struct _mp_lcd_i80_bus_obj_t {
     int wr_pin, dc_pin, cs_pin, freq;
 
     bool initialized;
-    // DMA 直接讀 Python bytearray，caller 持有引用
 } mp_lcd_i80_bus_obj_t;
 
 extern const mp_obj_type_t mp_lcd_i80_bus_type;

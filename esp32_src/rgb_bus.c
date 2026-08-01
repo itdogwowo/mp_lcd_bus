@@ -187,6 +187,9 @@ static mp_obj_t rgb_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     mp_buffer_info_t bufinfo;
     mp_get_buffer_raise(args[ARG_buf].u_obj, &bufinfo, MP_BUFFER_READ);
 
+    if (self->panel_handle == NULL) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("bus deinitialized"));
+    }
     if (self->queue_count >= RGB_DMA_QUEUE_DEPTH)
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
 
@@ -301,6 +304,14 @@ static mp_obj_t rgb_deinit(mp_obj_t self_in) {
     }
 
     self->initialized = false;
+    // ⚠ 修復：deinit 後 panel_handle 清 NULL，避免 use-after-free；
+    //    並清 ref_bufs / done_flags（原先殘留釘住 buffer 引用 → GC 洩漏）
+    self->panel_handle = NULL;
+    for (int i = 0; i < RGB_DMA_QUEUE_DEPTH; i++) {
+        self->ref_bufs[i] = mp_const_none;
+        self->done_flags[i] = false;
+    }
+    self->queue_count = 0;
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(rgb_deinit_obj, rgb_deinit);

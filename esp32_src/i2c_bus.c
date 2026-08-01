@@ -88,6 +88,9 @@ static mp_obj_t i2c_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     mp_buffer_info_t bufinfo;
     mp_get_buffer_raise(args[ARG_buf].u_obj, &bufinfo, MP_BUFFER_READ);
 
+    if (self->panel_io == NULL) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("bus deinitialized"));
+    }
     esp_err_t ret = esp_lcd_panel_io_tx_color(self->panel_io, -1, bufinfo.buf, bufinfo.len);
     if (ret != ESP_OK) {
         mp_raise_msg_varg(&mp_type_RuntimeError,
@@ -157,6 +160,8 @@ static mp_obj_t i2c_deinit(mp_obj_t self_in) {
     }
 
     self->initialized = false;
+    // ⚠ 修復：deinit 後 panel_io 清 NULL，避免後續 write()/readinto() use-after-free
+    self->panel_io = NULL;
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(i2c_deinit_obj, i2c_deinit);
