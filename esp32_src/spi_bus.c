@@ -76,19 +76,6 @@ static void spi_wait_free_slot(mp_lcd_spi_bus_obj_t *self) {
     }
 }
 
-// 等 queue 完全清空（阻塞）。PSRAM copy 路徑重用 zero_buf 前用。
-static void spi_wait_queue_empty(mp_lcd_spi_bus_obj_t *self) {
-    while (self->queue_count > 0) {
-        spi_transaction_t *rt;
-        if (spi_device_get_trans_result(self->handle, &rt, portMAX_DELAY) != ESP_OK) break;
-        int done = (int)(uintptr_t)rt->user - 1;
-        if (done >= 0 && done < SPI_DMA_QUEUE_DEPTH) {
-            self->ref_bufs[done] = mp_const_none;
-            self->queue_count--;
-        }
-    }
-}
-
 static int enqueue(mp_lcd_spi_bus_obj_t *self, const mp_obj_t buf, void *rx) {
     // ⚠ 修復：deinit 後 handle 為 NULL，直接報錯避免 use-after-free
     if (self->handle == NULL) {
@@ -337,38 +324,25 @@ static mp_obj_t spi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
         return mp_obj_new_int(tid);
     }
 
-    // ── 大 buffer 或非 DMA buffer：分 chunk 處理 ──
+    // ── 大 buffer 或 PSRAM：async 分 chunk 直送 ──
+    // v5.5 SPI driver 在 ISR（setup_priv_desc）自動處理外部 buffer：
+    //   DMA-capable（S3 PSRAM, SOC_PSRAM_DMA_CAPABLE=1）→ DMA descriptor 直讀零 copy；
+    //   unaligned / 非 DMA buffer → 內部 alloc + memcpy 兜底（不阻塞 Python）。
+    // 之前每 chunk memcpy + wait_queue_empty 的 copy 路徑會把本可異步的傳輸
+    // 強制序列化（fire 阻塞到每 chunk 傳完）→ decode/DMA 無法重疊。
     uint8_t *src = (uint8_t *)bufinfo.buf;
     size_t rem = bufinfo.len;
     int last_tid = -1;
-    bool is_internal = buf_is_internal(bufinfo.buf);
 
     while (rem > 0) {
         size_t n = rem > SPI_MAX_CHUNK ? SPI_MAX_CHUNK : rem;
-
-        if (!is_internal) {
-            // 非 DMA（PSRAM）→ copy 進 zero_buf 再送。
-            // 必須先等 queue 清空，才能安全重用 zero_buf（避免並行覆蓋）。
-            spi_wait_queue_empty(self);
-            memcpy(self->zero_buf, src, n);
-            int tid = enqueue_raw(self, self->zero_buf, n, NULL, mp_const_none);
-            if (tid < 0) {
-                mp_raise_msg_varg(&mp_type_RuntimeError,
-                    MP_ERROR_TEXT("queue failed err=0x%x"), -tid);
-            }
-            last_tid = tid;
-            // 同步：等這筆完成，才能重用 zero_buf
-            spi_wait_queue_empty(self);
-        } else {
-            // 內部 RAM 大 buffer → async 分 chunk（ref 指向同一 obj，GC-safe）
-            spi_wait_free_slot(self);
-            int tid = enqueue_raw(self, src, n, NULL, args[ARG_buf].u_obj);
-            if (tid < 0) {
-                mp_raise_msg_varg(&mp_type_RuntimeError,
-                    MP_ERROR_TEXT("queue failed err=0x%x"), -tid);
-            }
-            last_tid = tid;
+        spi_wait_free_slot(self);
+        int tid = enqueue_raw(self, src, n, NULL, args[ARG_buf].u_obj);
+        if (tid < 0) {
+            mp_raise_msg_varg(&mp_type_RuntimeError,
+                MP_ERROR_TEXT("queue failed err=0x%x"), -tid);
         }
+        last_tid = tid;
         src += n;
         rem -= n;
     }
