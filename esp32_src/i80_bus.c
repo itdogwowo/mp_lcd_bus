@@ -29,12 +29,12 @@ static void i80_reset_gpios(mp_lcd_i80_bus_obj_t *self);
 static bool on_color_done(esp_lcd_panel_io_handle_t panel_io,
                           esp_lcd_panel_io_event_data_t *edata, void *ctx) {
     mp_lcd_i80_bus_obj_t *self = (mp_lcd_i80_bus_obj_t *)ctx;
-    for (int i = 0; i < I80_DMA_QUEUE_DEPTH; i++) {
+    for (int i = 0; i < self->queue_depth; i++) {
         if (self->pending[i]) {
             self->pending[i] = false;
             // ⚠ 修復：釋放 buffer 引用（DMA 已讀完，可安全回收）
             self->ref_bufs[i] = mp_const_none;
-            self->queue_head = (self->queue_head + 1) % I80_DMA_QUEUE_DEPTH;
+            self->queue_head = (self->queue_head + 1) % self->queue_depth;
             self->queue_count--;
             break;
         }
@@ -44,13 +44,14 @@ static bool on_color_done(esp_lcd_panel_io_handle_t panel_io,
 
 
 static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
-    enum { ARG_data, ARG_wr, ARG_dc, ARG_cs, ARG_freq };
+    enum { ARG_data, ARG_wr, ARG_dc, ARG_cs, ARG_freq, ARG_queue_depth };
     static const mp_arg_t allowed[] = {
         { MP_QSTR_data, MP_ARG_OBJ | MP_ARG_REQUIRED },
         { MP_QSTR_wr,   MP_ARG_INT | MP_ARG_REQUIRED },
         { MP_QSTR_dc,   MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
         { MP_QSTR_cs,   MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
         { MP_QSTR_freq, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 10000000} },
+        { MP_QSTR_queue_depth, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = I80_DEFAULT_QUEUE_DEPTH} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed), allowed, args);
@@ -68,6 +69,11 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     if (n != 8 && n != 16)
         mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("I80 data pins must be 8 or 16"));
 
+    int qdepth = args[ARG_queue_depth].u_int;
+    if (qdepth < 1 || qdepth > I80_MAX_QUEUE_DEPTH)
+        mp_raise_msg_varg(&mp_type_ValueError,
+            MP_ERROR_TEXT("queue_depth must be 1-%d"), I80_MAX_QUEUE_DEPTH);
+
     mp_lcd_i80_bus_obj_t *self = m_new_obj(mp_lcd_i80_bus_obj_t);
     self->base.type = &mp_lcd_i80_bus_type;
     self->lane_count = (int)n;
@@ -75,6 +81,7 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     self->dc_pin = args[ARG_dc].u_int;
     self->cs_pin = args[ARG_cs].u_int;
     self->freq   = args[ARG_freq].u_int;
+    self->queue_depth = qdepth;
 
     for (int i = 0; i < 16; i++)
         self->data_pins[i] = (i < (int)n) ? mp_obj_get_int(items[i]) : -1;
@@ -113,7 +120,7 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     esp_lcd_panel_io_i80_config_t iocfg = {
         .cs_gpio_num   = self->cs_pin,
         .pclk_hz       = (uint32_t)self->freq,
-        .trans_queue_depth = I80_DMA_QUEUE_DEPTH,
+        .trans_queue_depth = self->queue_depth,
         .on_color_trans_done = on_color_done,
         .user_ctx      = self,
         .lcd_cmd_bits  = 8,
@@ -130,7 +137,7 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     }
 
     memset(self->pending, 0, sizeof(self->pending));
-    for (int i = 0; i < I80_DMA_QUEUE_DEPTH; i++) self->ref_bufs[i] = mp_const_none;
+    for (int i = 0; i < self->queue_depth; i++) self->ref_bufs[i] = mp_const_none;
     self->queue_head = self->queue_tail = self->queue_count = 0;
     self->initialized = true;
 
@@ -174,7 +181,7 @@ static mp_obj_t i80_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     // 單筆（不分 chunk）維持「queue 滿立即 raise」的相容語意。
     // ══════════════════════════════════════════════════════════════
     bool single = (bufinfo.len <= I80_MAX_CHUNK);
-    if (single && self->queue_count >= I80_DMA_QUEUE_DEPTH)
+    if (single && self->queue_count >= self->queue_depth)
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
 
     if (self->panel_io == NULL) {
@@ -190,7 +197,7 @@ static mp_obj_t i80_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
         size_t n = rem > I80_MAX_CHUNK ? I80_MAX_CHUNK : rem;
 
         // 等一個空槽（on_color_done 回呼會遞減 queue_count）
-        while (self->queue_count >= I80_DMA_QUEUE_DEPTH) {
+        while (self->queue_count >= self->queue_depth) {
             mp_hal_delay_ms(1);
         }
 
@@ -204,7 +211,7 @@ static mp_obj_t i80_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
             mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("tx_color failed"));
         }
 
-        self->queue_tail = (self->queue_tail + 1) % I80_DMA_QUEUE_DEPTH;
+        self->queue_tail = (self->queue_tail + 1) % self->queue_depth;
         self->queue_count++;
         cur_tid = slot + 1;
         if (first_tid < 0) first_tid = cur_tid;  // 回傳第一個 chunk tid（FIFO wait 等到底）
@@ -251,7 +258,7 @@ static mp_obj_t i80_wait(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_a
     int to  = args[ARG_timeout_ms].u_int;
     int idx = tid - 1;
 
-    if (idx < 0 || idx >= I80_DMA_QUEUE_DEPTH) return mp_const_false;
+    if (idx < 0 || idx >= self->queue_depth) return mp_const_false;
     if (!self->pending[idx]) return mp_const_true;
 
     mp_uint_t deadline = mp_hal_ticks_ms() + (to < 0 ? 10000 : to);
@@ -280,7 +287,7 @@ static mp_obj_t i80_wait_all(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
     while (self->queue_count > 0) {
         if (mp_hal_ticks_ms() > deadline) {
             // timeout: DMA 不回呼，強制清空 queue 避免卡死
-            for (int i = 0; i < I80_DMA_QUEUE_DEPTH; i++) {
+            for (int i = 0; i < self->queue_depth; i++) {
                 self->pending[i] = false;
                 self->ref_bufs[i] = mp_const_none;  // ⚠ 同步釋放引用
             }
@@ -332,7 +339,7 @@ static mp_obj_t i80_deinit(mp_obj_t self_in) {
     if (s_last_i80_panel_io == io_h)   s_last_i80_panel_io = NULL;
 
     // 釋放 DMA buffer references
-    for (int i = 0; i < I80_DMA_QUEUE_DEPTH; i++) {
+    for (int i = 0; i < self->queue_depth; i++) {
         self->pending[i] = false;
         self->ref_bufs[i] = mp_const_none;  // ⚠ 同步釋放引用
     }

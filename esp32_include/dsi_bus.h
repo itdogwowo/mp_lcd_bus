@@ -13,7 +13,9 @@ extern const mp_obj_type_t mp_lcd_dsi_bus_type;
 
 #include "esp_lcd_mipi_dsi.h"
 
-#define DSI_DMA_QUEUE_DEPTH 4
+// 佇列槽上限（陣列大小），實際深度由建構子 queue_depth 決定（1..此值）
+#define DSI_MAX_QUEUE_DEPTH    8
+#define DSI_DEFAULT_QUEUE_DEPTH 4
 #define DSI_MAX_FBS         3
 
 typedef struct _mp_lcd_dsi_bus_obj_t {
@@ -23,9 +25,10 @@ typedef struct _mp_lcd_dsi_bus_obj_t {
     esp_lcd_panel_io_handle_t dbi_io;
     esp_lcd_panel_handle_t    dpi_panel;
 
-    mp_obj_t ref_bufs[DSI_DMA_QUEUE_DEPTH];
-    bool done_flags[DSI_DMA_QUEUE_DEPTH];
+    mp_obj_t ref_bufs[DSI_MAX_QUEUE_DEPTH];
+    bool done_flags[DSI_MAX_QUEUE_DEPTH];
     int queue_head, queue_tail, queue_count;
+    int queue_depth;
 
     int lane_count;
     int panel_w, panel_h;

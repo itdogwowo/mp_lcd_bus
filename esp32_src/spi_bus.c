@@ -41,7 +41,7 @@ static int enqueue_raw(mp_lcd_spi_bus_obj_t *self, const void *data, size_t len,
     if (self->handle == NULL) {
         return -((int)ESP_ERR_INVALID_STATE);
     }
-    if (self->queue_count >= SPI_DMA_QUEUE_DEPTH) {
+    if (self->queue_count >= self->queue_depth) {
         return -((int)ESP_ERR_INVALID_STATE);
     }
     int idx = self->queue_tail;
@@ -58,18 +58,18 @@ static int enqueue_raw(mp_lcd_spi_bus_obj_t *self, const void *data, size_t len,
         self->ref_bufs[idx] = mp_const_none;
         return -((int)ret);
     }
-    self->queue_tail = (self->queue_tail + 1) % SPI_DMA_QUEUE_DEPTH;
+    self->queue_tail = (self->queue_tail + 1) % self->queue_depth;
     self->queue_count++;
     return idx + 1;
 }
 
 // 等 queue 空出至少一個槽（阻塞）。大 buffer 分 chunk 時用。
 static void spi_wait_free_slot(mp_lcd_spi_bus_obj_t *self) {
-    while (self->queue_count >= SPI_DMA_QUEUE_DEPTH) {
+    while (self->queue_count >= self->queue_depth) {
         spi_transaction_t *rt;
         if (spi_device_get_trans_result(self->handle, &rt, portMAX_DELAY) != ESP_OK) break;
         int done = (int)(uintptr_t)rt->user - 1;
-        if (done >= 0 && done < SPI_DMA_QUEUE_DEPTH) {
+        if (done >= 0 && done < self->queue_depth) {
             self->ref_bufs[done] = mp_const_none;
             self->queue_count--;
         }
@@ -91,7 +91,7 @@ static void spi_drain_pending(mp_lcd_spi_bus_obj_t *self) {
         spi_transaction_t *rt;
         if (spi_device_get_trans_result(self->handle, &rt, 0) != ESP_OK) break;
         int done = (int)(uintptr_t)rt->user - 1;
-        if (done >= 0 && done < SPI_DMA_QUEUE_DEPTH) {
+        if (done >= 0 && done < self->queue_depth) {
             self->ref_bufs[done] = mp_const_none;
             self->queue_count--;
         }
@@ -124,7 +124,7 @@ static void spi_deinit_hardware(mp_lcd_spi_bus_obj_t *self) {
 }
 
 static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
-    enum { ARG_data, ARG_clk, ARG_freq, ARG_host, ARG_sck, ARG_mosi, ARG_miso };
+    enum { ARG_data, ARG_clk, ARG_freq, ARG_host, ARG_sck, ARG_mosi, ARG_miso, ARG_queue_depth };
     static const mp_arg_t allowed[] = {
         { MP_QSTR_data, MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
         { MP_QSTR_clk,  MP_ARG_INT, {.u_int = -1} },
@@ -133,6 +133,7 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         { MP_QSTR_sck,  MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
         { MP_QSTR_mosi, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
         { MP_QSTR_miso, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
+        { MP_QSTR_queue_depth, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = SPI_DEFAULT_QUEUE_DEPTH} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed), allowed, args);
@@ -170,6 +171,11 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
             MP_ERROR_TEXT("host=%d not available (valid: 1..%d)"), host, SOC_SPI_PERIPH_NUM - 1);
     }
 
+    int qdepth = args[ARG_queue_depth].u_int;
+    if (qdepth < 1 || qdepth > SPI_MAX_QUEUE_DEPTH)
+        mp_raise_msg_varg(&mp_type_ValueError,
+            MP_ERROR_TEXT("queue_depth must be 1-%d"), SPI_MAX_QUEUE_DEPTH);
+
     if (s_spi_device[host]) {
         spi_bus_remove_device(s_spi_device[host]);
         s_spi_device[host] = NULL;
@@ -183,6 +189,7 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     self->clk_pin = clk_pin;
     self->freq    = args[ARG_freq].u_int;
     self->host    = host;
+    self->queue_depth = qdepth;
 
     int miso_pin = -1;
     if (use_data_style) {
@@ -232,7 +239,7 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         .clock_speed_hz = (uint32_t)self->freq,
         .mode = 0,
         .spics_io_num = -1,
-        .queue_size = SPI_DMA_QUEUE_DEPTH,
+        .queue_size = self->queue_depth,
         .flags = dflags,
     };
 
@@ -312,7 +319,7 @@ static mp_obj_t spi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     mp_get_buffer_raise(args[ARG_buf].u_obj, &bufinfo, MP_BUFFER_READ);
 
     bool single = (bufinfo.len <= SPI_MAX_CHUNK && buf_is_internal(bufinfo.buf));
-    if (single && self->queue_count >= SPI_DMA_QUEUE_DEPTH)
+    if (single && self->queue_count >= self->queue_depth)
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
 
     if (single) {
@@ -365,7 +372,7 @@ static mp_obj_t spi_readinto(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
     mp_lcd_spi_bus_obj_t *self = (mp_lcd_spi_bus_obj_t *)args[ARG_self].u_obj;
-    if (self->queue_count >= SPI_DMA_QUEUE_DEPTH)
+    if (self->queue_count >= self->queue_depth)
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
 
     mp_buffer_info_t rxb;
@@ -392,7 +399,7 @@ static mp_obj_t spi_readinto(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
         mp_raise_msg_varg(&mp_type_RuntimeError,
             MP_ERROR_TEXT("readinto queue failed err=0x%x"), ret);
     }
-    self->queue_tail = (self->queue_tail + 1) % SPI_DMA_QUEUE_DEPTH;
+    self->queue_tail = (self->queue_tail + 1) % self->queue_depth;
     self->queue_count++;
     return mp_obj_new_int(idx + 1);
 }
@@ -410,7 +417,7 @@ static mp_obj_t spi_write_readinto(size_t n_args, const mp_obj_t *pos_args, mp_m
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
     mp_lcd_spi_bus_obj_t *self = (mp_lcd_spi_bus_obj_t *)args[ARG_self].u_obj;
-    if (self->queue_count >= SPI_DMA_QUEUE_DEPTH)
+    if (self->queue_count >= self->queue_depth)
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
 
     mp_buffer_info_t wbi, rbi;
@@ -433,7 +440,7 @@ static mp_obj_t spi_write_readinto(size_t n_args, const mp_obj_t *pos_args, mp_m
         mp_raise_msg_varg(&mp_type_RuntimeError,
             MP_ERROR_TEXT("write_readinto queue failed err=0x%x"), ret);
     }
-    self->queue_tail = (self->queue_tail + 1) % SPI_DMA_QUEUE_DEPTH;
+    self->queue_tail = (self->queue_tail + 1) % self->queue_depth;
     self->queue_count++;
     return mp_obj_new_int(idx + 1);
 }
@@ -472,7 +479,7 @@ static mp_obj_t spi_wait(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_a
     int tid = args[ARG_trans_id].u_int;
     int to = args[ARG_timeout_ms].u_int;
     int idx = tid - 1;
-    if (idx < 0 || idx >= SPI_DMA_QUEUE_DEPTH) return mp_const_false;
+    if (idx < 0 || idx >= self->queue_depth) return mp_const_false;
     if (self->ref_bufs[idx] == mp_const_none) return mp_const_true;
 
     TickType_t tt = (to < 0) ? portMAX_DELAY : pdMS_TO_TICKS(to);
@@ -481,7 +488,7 @@ static mp_obj_t spi_wait(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_a
         if (spi_device_get_trans_result(self->handle, &rt, tt) != ESP_OK)
             return mp_const_false;
         int done = (int)(uintptr_t)rt->user - 1;
-        if (done >= 0 && done < SPI_DMA_QUEUE_DEPTH) {
+        if (done >= 0 && done < self->queue_depth) {
             self->ref_bufs[done] = mp_const_none;
             self->queue_count--;
         }
@@ -508,7 +515,7 @@ static mp_obj_t spi_wait_all(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
         spi_transaction_t *rt;
         if (spi_device_get_trans_result(self->handle, &rt, tt) != ESP_OK) break;
         int done = (int)(uintptr_t)rt->user - 1;
-        if (done >= 0 && done < SPI_DMA_QUEUE_DEPTH) {
+        if (done >= 0 && done < self->queue_depth) {
             self->ref_bufs[done] = mp_const_none;
             self->queue_count--;
         }
@@ -519,7 +526,7 @@ static mp_obj_t spi_wait_all(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
     // 不需要立即 GC — 每幀 flush 都會呼叫 wait_all，full GC 在 PSRAM heap + 大
     // frame buffer 上可達 ~200ms（實測），是 120ms/幀 的主因。
     if (self->queue_count > 0) {
-        for (int i = 0; i < SPI_DMA_QUEUE_DEPTH; i++) {
+        for (int i = 0; i < self->queue_depth; i++) {
             self->ref_bufs[i] = mp_const_none;
         }
         self->queue_count = 0;

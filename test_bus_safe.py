@@ -134,7 +134,8 @@ def test_spi():
     sec("隊列滿防護")
     caught = False
     try:
-        for _ in range(8):
+        # 寫超過 queue_depth（可透過建構子調 1..8）→ 第 queue_depth+1 筆拋出
+        for _ in range(16):
             bus.write(bytearray(64))
     except RuntimeError as e:
         if "queue full" in str(e):

@@ -8,7 +8,8 @@
 #include "esp_lcd_panel_io.h"
 #include "py/obj.h"
 
-#define I80_DMA_QUEUE_DEPTH 4
+#define I80_MAX_QUEUE_DEPTH    8
+#define I80_DEFAULT_QUEUE_DEPTH 4
 
 typedef struct _mp_lcd_i80_bus_obj_t {
     mp_obj_base_t base;
@@ -16,9 +17,9 @@ typedef struct _mp_lcd_i80_bus_obj_t {
     esp_lcd_i80_bus_handle_t bus_handle;
     esp_lcd_panel_io_handle_t panel_io;
 
-    bool pending[I80_DMA_QUEUE_DEPTH];      // DMA 完成旗標
-    mp_obj_t ref_bufs[I80_DMA_QUEUE_DEPTH]; // ⚠ 持有 Python buffer 引用（防 DMA 讀取中被 GC 回收）
-    int queue_head, queue_tail, queue_count;
+    bool pending[I80_MAX_QUEUE_DEPTH];      // DMA 完成旗標
+    mp_obj_t ref_bufs[I80_MAX_QUEUE_DEPTH]; // ⚠ 持有 Python buffer 引用（防 DMA 讀取中被 GC 回收）
+    int queue_head, queue_tail, queue_count, queue_depth;
 
     int lane_count;
     int data_pins[16];

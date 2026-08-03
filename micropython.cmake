@@ -28,6 +28,16 @@ if(ESP_PLATFORM)
         list(APPEND INCLUDES ${esp_lcd_includes})
     endif()
 
+    # esp_cache.h lives in the esp_mm component. esp_lcd depends on esp_mm
+    # privately (PRIV_REQUIRES), so its include dirs are NOT propagated to us.
+    # dsi_bus.c needs esp_cache.h for esp_cache_msync() (flush, ESP32-P4).
+    idf_component_get_property(esp_mm_includes esp_mm INCLUDE_DIRS)
+    idf_component_get_property(esp_mm_dir esp_mm COMPONENT_DIR)
+    if(esp_mm_includes)
+        list(TRANSFORM esp_mm_includes PREPEND ${esp_mm_dir}/)
+        list(APPEND INCLUDES ${esp_mm_includes})
+    endif()
+
 else()
     set(INCLUDES
         ${CMAKE_CURRENT_LIST_DIR}

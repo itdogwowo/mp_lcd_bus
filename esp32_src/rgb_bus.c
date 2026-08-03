@@ -21,11 +21,11 @@ static esp_lcd_panel_handle_t s_last_rgb_panel = NULL;
 static bool on_vsync(esp_lcd_panel_handle_t panel,
                      const esp_lcd_rgb_panel_event_data_t *edata, void *ctx) {
     mp_lcd_rgb_bus_obj_t *self = (mp_lcd_rgb_bus_obj_t *)ctx;
-    for (int i = 0; i < RGB_DMA_QUEUE_DEPTH; i++) {
+    for (int i = 0; i < self->queue_depth; i++) {
         if (self->ref_bufs[i] != mp_const_none && !self->done_flags[i]) {
             self->done_flags[i] = true;
             self->ref_bufs[i] = mp_const_none;
-            self->queue_head = (self->queue_head + 1) % RGB_DMA_QUEUE_DEPTH;
+            self->queue_head = (self->queue_head + 1) % self->queue_depth;
             self->queue_count--;
             break;
         }
@@ -43,6 +43,7 @@ static mp_obj_t rgb_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         ARG_hsync_idle_low, ARG_vsync_idle_low,
         ARG_de_idle_high, ARG_pclk_idle_high, ARG_pclk_active_neg,
         ARG_disp_active_low, ARG_refresh_on_demand, ARG_bb_size_px,
+        ARG_queue_depth,
     };
     static const mp_arg_t allowed[] = {
         { MP_QSTR_data,              MP_ARG_OBJ | MP_ARG_REQUIRED },
@@ -68,6 +69,7 @@ static mp_obj_t rgb_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         { MP_QSTR_disp_active_low,   MP_ARG_BOOL | MP_ARG_KW_ONLY, {.u_bool = false} },
         { MP_QSTR_refresh_on_demand, MP_ARG_BOOL | MP_ARG_KW_ONLY, {.u_bool = true} },
         { MP_QSTR_bb_size_px,        MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
+        { MP_QSTR_queue_depth,       MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = RGB_DEFAULT_QUEUE_DEPTH} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed), allowed, args);
@@ -77,6 +79,11 @@ static mp_obj_t rgb_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     mp_obj_get_array(args[ARG_data].u_obj, &n, &items);
     if (n != 8 && n != 16)
         mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("RGB data pins must be 8 or 16"));
+
+    int qdepth = args[ARG_queue_depth].u_int;
+    if (qdepth < 1 || qdepth > RGB_MAX_QUEUE_DEPTH)
+        mp_raise_msg_varg(&mp_type_ValueError,
+            MP_ERROR_TEXT("queue_depth must be 1-%d"), RGB_MAX_QUEUE_DEPTH);
 
     mp_lcd_rgb_bus_obj_t *self = m_new_obj(mp_lcd_rgb_bus_obj_t);
     self->base.type = &mp_lcd_rgb_bus_type;
@@ -89,6 +96,7 @@ static mp_obj_t rgb_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     self->panel_w   = args[ARG_width].u_int;
     self->panel_h   = args[ARG_height].u_int;
     self->freq      = args[ARG_freq].u_int;
+    self->queue_depth = qdepth;
 
     for (int i = 0; i < 16; i++)
         self->data_pins[i] = (i < (int)n) ? mp_obj_get_int(items[i]) : -1;
@@ -190,7 +198,7 @@ static mp_obj_t rgb_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     if (self->panel_handle == NULL) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("bus deinitialized"));
     }
-    if (self->queue_count >= RGB_DMA_QUEUE_DEPTH)
+    if (self->queue_count >= self->queue_depth)
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
 
     int idx = self->queue_tail;
@@ -207,7 +215,7 @@ static mp_obj_t rgb_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("draw_bitmap failed"));
     }
 
-    self->queue_tail = (self->queue_tail + 1) % RGB_DMA_QUEUE_DEPTH;
+    self->queue_tail = (self->queue_tail + 1) % self->queue_depth;
     self->queue_count++;
     return mp_obj_new_int(idx + 1);
 }
@@ -245,7 +253,7 @@ static mp_obj_t rgb_wait(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_a
     int to  = args[ARG_timeout_ms].u_int;
     int idx = tid - 1;
 
-    if (idx < 0 || idx >= RGB_DMA_QUEUE_DEPTH) return mp_const_false;
+    if (idx < 0 || idx >= self->queue_depth) return mp_const_false;
     if (self->ref_bufs[idx] == mp_const_none) return mp_const_true;
 
     mp_uint_t deadline = mp_hal_ticks_ms() + (to < 0 ? 10000 : to);
@@ -279,7 +287,7 @@ static mp_obj_t rgb_wait_all(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
     // wait_all，full GC 在 PSRAM heap + 大 frame buffer 上可達 ~200ms（實測），
     // 是「每幀慢 200ms」的主因。僅在逾時殘留（queue 未清空）時才強制釋放 + gc_collect。
     if (self->queue_count > 0) {
-        for (int i = 0; i < RGB_DMA_QUEUE_DEPTH; i++) {
+        for (int i = 0; i < self->queue_depth; i++) {
             self->ref_bufs[i] = mp_const_none;
             self->done_flags[i] = true;
         }
@@ -317,7 +325,7 @@ static mp_obj_t rgb_deinit(mp_obj_t self_in) {
     // ⚠ 修復：deinit 後 panel_handle 清 NULL，避免 use-after-free；
     //    並清 ref_bufs / done_flags（原先殘留釘住 buffer 引用 → GC 洩漏）
     self->panel_handle = NULL;
-    for (int i = 0; i < RGB_DMA_QUEUE_DEPTH; i++) {
+    for (int i = 0; i < self->queue_depth; i++) {
         self->ref_bufs[i] = mp_const_none;
         self->done_flags[i] = false;
     }

@@ -8,16 +8,17 @@
 #include "esp_lcd_panel_rgb.h"
 #include "py/obj.h"
 
-#define RGB_DMA_QUEUE_DEPTH 2
+#define RGB_MAX_QUEUE_DEPTH    8
+#define RGB_DEFAULT_QUEUE_DEPTH 2
 
 typedef struct _mp_lcd_rgb_bus_obj_t {
     mp_obj_base_t base;
 
     esp_lcd_panel_handle_t panel_handle;
 
-    mp_obj_t ref_bufs[RGB_DMA_QUEUE_DEPTH];
-    bool done_flags[RGB_DMA_QUEUE_DEPTH];
-    int queue_head, queue_tail, queue_count;
+    mp_obj_t ref_bufs[RGB_MAX_QUEUE_DEPTH];
+    bool done_flags[RGB_MAX_QUEUE_DEPTH];
+    int queue_head, queue_tail, queue_count, queue_depth;
 
     int lane_count;
     int data_pins[16];

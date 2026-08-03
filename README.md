@@ -47,6 +47,7 @@ All buses expose the same methods:
 | `wait_all(timeout_ms=-1)` → `None` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `lane_count()` → `int` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `frame_buffer(idx)` → `bytearray` | ❌ | ❌ | ❌ | ❌ | ✅ |
+| `flush(idx=0, *, x=0, y=0, w=0, h=0)` → `None` | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `set_pattern(pat)` | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `deinit()` | ✅ | ✅ | ✅ | ✅ | ✅ |
 
@@ -55,7 +56,7 @@ All buses expose the same methods:
 ### SPIBus
 
 ```python
-lcd_bus.SPIBus(data, clk, *, freq=40_000_000, host=1)
+lcd_bus.SPIBus(data, clk, *, freq=40_000_000, host=1, queue_depth=8)
 ```
 
 `data` tuple length determines lane count:
@@ -86,7 +87,7 @@ bus = lcd_bus.I2CBus(data=(21,), clk=22, addr=0x3C)
 ### I80Bus (ESP32-S3/P4 only)
 
 ```python
-lcd_bus.I80Bus(data, wr, *, cs=-1, freq=10_000_000)
+lcd_bus.I80Bus(data, wr, *, cs=-1, freq=10_000_000, queue_depth=4)
 ```
 
 `data` must be 8 or 16 pins:
@@ -107,7 +108,7 @@ lcd_bus.RGBBus(data, hsync, vsync, de, pclk, width, height, *,
                vsync_pulse_width=1, vsync_idle_low=False,
                de_idle_high=False, pclk_idle_high=False,
                pclk_active_neg=False, disp_active_low=False,
-               refresh_on_demand=False, bb_size_px=0)
+               refresh_on_demand=False, bb_size_px=0, queue_depth=2)
 ```
 
 ### DSIBus (ESP32-P4 only)
@@ -117,8 +118,11 @@ lcd_bus.DSIBus(lanes, width, height, lane_bit_rate_mbps, *,
                dpi_clk_mhz=30.0,
                hsync_pulse_width=1, hsync_back_porch=10, hsync_front_porch=10,
                vsync_pulse_width=1, vsync_back_porch=10, vsync_front_porch=10,
+               hsync_idle_pixel=0, vsync_idle_line=0,
                in_color_format=16, fb_count=2, rst=-1,
-               virtual_channel=0)
+               virtual_channel=0,
+               cmd_bits=8, param_bits=8,
+               use_dma2d=True, queue_depth=4)
 ```
 
 | Param | Type | Default | Description |
@@ -128,10 +132,19 @@ lcd_bus.DSIBus(lanes, width, height, lane_bit_rate_mbps, *,
 | `lane_bit_rate_mbps` | float | required | DSI PHY lane bit rate in Mbps (e.g. 1000) |
 | `dpi_clk_mhz` | float | 30.0 | Pixel clock (DPI) frequency in MHz |
 | `hsync/vsync_*` | int | 1/10/10 | Video timing (porches & pulse width, in px/lines) |
+| `hsync_idle_pixel`, `vsync_idle_line` | int | 0 | Idle blanking period in the timing (some panels require non-zero) |
 | `in_color_format` | int | 16 | `16` = RGB565, `24` = RGB888 |
 | `fb_count` | int | 2 | Number of internal frame buffers (1-3), allocated in PSRAM by the driver |
 | `rst` | int | -1 | Panel hardware reset GPIO (`-1` = not used) |
 | `virtual_channel` | int | 0 | DSI virtual channel (0-3) |
+| `cmd_bits`, `param_bits` | int | 8 | DBI command/parameter bit width (rare panels use other widths) |
+| `use_dma2d` | bool | True | `True` = copy via DMA2D, `False` = fall back to CPU copy |
+| `queue_depth` | int | 4 | Async write pipeline depth (1-8); more slots = more memory, deeper pipelining |
+
+> **All panel-specific parameters are configurable from Python** — nothing in the
+> C module needs editing to bring up a different panel. Panel init commands
+> (`cmd()` sequence), reset/backlight pins, and the DSI PHY LDO are handled at
+> the Python layer too (see `test_dsi.py`).
 
 The driver allocates screen-sized frame buffers internally; `frame_buffer(idx)` returns a zero-copy `bytearray` view of one. Writes are asynchronous — the bus copies the buffer into a frame buffer, and `write()` returns a `trans_id` you can `wait()` on:
 
@@ -149,10 +162,62 @@ bus.wait(tid)
 
 fb = bus.frame_buffer(0)         # zero-copy view of internal fb
 memoryview(fb)[:2] = b'\xf8\x00' # draw directly into the framebuffer
+bus.flush()                      # ⚠ write dirty L2 cache lines back to PSRAM
 
 bus.set_pattern(1)               # built-in test pattern (0=none,1=ver bar,2=hor bar,3=BER)
 bus.set_pattern(0)               # back to normal
 ```
+
+### DSIBus frame buffer writes & double buffering (ESP32-P4)
+
+**⚠️ `flush()` is mandatory after direct writes through `frame_buffer(idx)`.**
+
+On ESP32-P4 the frame buffers live in PSRAM. CPU writes go through the
+write-back L2 cache, but the DPI DMA reads PSRAM **directly** (it bypasses the
+cache). Without `esp_cache_msync()` the DMA keeps reading stale, not-yet
+written-back lines — visible as ghosting / black bands / flicker. `flush()`
+writes the dirty cache lines of the given region back to PSRAM (same operation
+the esp_lcd driver does internally), so always call it after drawing into a
+`frame_buffer()` view:
+
+```python
+fb = bus.frame_buffer(0)
+fill_screen(fb, color)   # CPU writes into PSRAM (cached)
+bus.flush()              # write-back before the DPI DMA sees it
+```
+
+**Tearing rules (`fb_count` semantics):**
+
+| fb_count | `write(buf)` with external buffer | Direct `frame_buffer()` writes |
+|---|---|---|
+| 1 | DMA2D copies into the *displayed* fb → tearing during the copy (~ms) | Tearing while writing the scanned buffer; inherent to single buffering |
+| 2+ | Same as above — external buffers always land on the *displayed* fb | Tear-free only when using the swap pattern below |
+
+**Tear-free double buffering** (works with `fb_count=2`): the esp_lcd P4 driver
+keeps one DMA link list per fb and switches to the fb you pass to
+`draw_bitmap()` **at the frame boundary** — but only when the draw buffer *is*
+an internal fb (no copy, just cache write-back + swap). So draw the full frame
+into the fb that is **not** currently displayed, then hand that fb view to
+`write()`:
+
+```python
+fb0 = bus.frame_buffer(0)
+fb1 = bus.frame_buffer(1)
+
+while True:
+    draw_full_frame(fb1, frame_a)   # fb0 is displayed, draw into fb1
+    bus.write(fb1); bus.wait_all()  # msync + switch at next frame boundary
+    draw_full_frame(fb0, frame_b)   # fb1 is displayed, draw into fb0
+    bus.write(fb0); bus.wait_all()
+```
+
+Rules: always update the **whole** frame (or keep both fbs in sync), because
+after the switch the un-drawn region shows that fb's old content. Partial
+updates with multiple fbs will flip between stale contents every frame.
+
+For reference, `test_dsi.py` covers all three paths: direct writes + `flush()`
+(colors/gradient), async `write()` with external buffers, and the tear-free
+double-buffer swap demo.
 
 ---
 
@@ -167,7 +232,7 @@ Two modes determined by `cmd`:
 | Returns | `trans_id` (int) | `None` |
 | cmd/addr phase | None | Yes (8-bit cmd + 24-bit addr) |
 | Async? | Async, returns immediately | Sync, returns after completion |
-| Queue depth | Up to 4 (`SPI_DMA_QUEUE_DEPTH`) | No queue |
+| Queue depth | Up to `queue_depth` (default 8) | No queue |
 | Use case | Bulk pixel data | LCD commands, pixel preamble |
 
 **Parameters:**
@@ -273,7 +338,7 @@ except RuntimeError as e:
 
 ### Queue Depth
 
-`SPI_DMA_QUEUE_DEPTH = 8` is not a hardware DMA limit — it's a memory optimization (~28 bytes/slot). Adjust in `esp32_include/spi_bus.h`. 8 is sufficient for the common `write → wait` serial pattern.
+`queue_depth` is not a hardware DMA limit — it's a memory optimization (~28 bytes/slot). It is configurable per bus through the constructor (range 1-8): `SPIBus(..., queue_depth=8)`, `I80Bus(..., queue_depth=4)`, `RGBBus(..., queue_depth=2)`, `DSIBus(..., queue_depth=4)`. 8 is sufficient for the common `write → wait` serial pattern.
 
 ### Non-blocking Check
 
@@ -324,7 +389,7 @@ Test suite (7 areas, 23 assertions):
 
 | # | Test | Description | Assertions |
 |---|------|-------------|------------|
-| 1 | `test_spi` | SPI init, write, 4-deep queue, queue-full guard, deinit | 11 |
+| 1 | `test_spi` | SPI init, write, queue-depth queue, queue-full guard, deinit | 11 |
 | 2 | `test_spi_multilane` | Auto-detect 1/2/4/8-lane from `data` tuple | 4 |
 | 3 | `test_spi_official` | Full-duplex (sck/mosi/miso), `readinto()` | 5 |
 | 4 | `test_speed` | Throughput benchmarks (1/2/4 lanes, 40/80 MHz) | output only |

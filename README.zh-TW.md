@@ -12,7 +12,7 @@ import lcd_bus
 
 | 類型 | 底層 | DMA | 非同步 |
 |---|---|---|---|
-| `lcd_bus.SPIBus` | `spi_device_queue_trans` | ✅ | ✅ 4 層隊列 |
+| `lcd_bus.SPIBus` | `spi_device_queue_trans` | ✅ | ✅ 8 層隊列 |
 | `lcd_bus.I80Bus` | `esp_lcd_i80` | ✅ | ✅ 4 層隊列 |
 | `lcd_bus.RGBBus` | `esp_lcd_rgb` | ✅ | ✅ 2 層隊列 |
 | `lcd_bus.DSIBus` | `esp_lcd_mipi_dsi`（僅 ESP32-P4） | ✅ | ✅ 4 層隊列 |
@@ -47,6 +47,7 @@ import lcd_bus
 | `wait_all(timeout_ms=-1)` → `None` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `lane_count()` → `int` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `frame_buffer(idx)` → `bytearray` | ❌ | ❌ | ❌ | ❌ | ✅ |
+| `flush(idx=0, *, x=0, y=0, w=0, h=0)` → `None` | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `set_pattern(pat)` | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `deinit()` | ✅ | ✅ | ✅ | ✅ | ✅ |
 
@@ -55,7 +56,7 @@ import lcd_bus
 ### SPIBus
 
 ```python
-lcd_bus.SPIBus(data, clk, *, freq=40_000_000, host=1)
+lcd_bus.SPIBus(data, clk, *, freq=40_000_000, host=1, queue_depth=8)
 ```
 
 `data` tuple 長度自動決定 lane 數：
@@ -86,7 +87,7 @@ bus = lcd_bus.I2CBus(data=(21,), clk=22, addr=0x3C)
 ### I80Bus（僅 ESP32-S3/P4）
 
 ```python
-lcd_bus.I80Bus(data, wr, *, cs=-1, freq=10_000_000)
+lcd_bus.I80Bus(data, wr, *, cs=-1, freq=10_000_000, queue_depth=4)
 ```
 
 ```python
@@ -108,8 +109,11 @@ lcd_bus.DSIBus(lanes, width, height, lane_bit_rate_mbps, *,
                dpi_clk_mhz=30.0,
                hsync_pulse_width=1, hsync_back_porch=10, hsync_front_porch=10,
                vsync_pulse_width=1, vsync_back_porch=10, vsync_front_porch=10,
+               hsync_idle_pixel=0, vsync_idle_line=0,
                in_color_format=16, fb_count=2, rst=-1,
-               virtual_channel=0)
+               virtual_channel=0,
+               cmd_bits=8, param_bits=8,
+               use_dma2d=True, queue_depth=4)
 ```
 
 | 參數 | 類型 | 預設 | 說明 |
@@ -119,10 +123,18 @@ lcd_bus.DSIBus(lanes, width, height, lane_bit_rate_mbps, *,
 | `lane_bit_rate_mbps` | float | 必填 | DSI PHY lane bit rate（Mbps，如 1000） |
 | `dpi_clk_mhz` | float | 30.0 | 像素（DPI）時脈 MHz |
 | `hsync/vsync_*` | int | 1/10/10 | video timing（porch 與 pulse width，單位 px/行） |
+| `hsync_idle_pixel`, `vsync_idle_line` | int | 0 | timing 的 idle 空閒週期（部分面板需非 0） |
 | `in_color_format` | int | 16 | `16` = RGB565，`24` = RGB888 |
 | `fb_count` | int | 2 | 內部 frame buffer 數（1-3），由 driver 配置於 PSRAM |
 | `rst` | int | -1 | 面板硬體 reset GPIO（`-1` = 不使用） |
 | `virtual_channel` | int | 0 | DSI virtual channel（0-3） |
+| `cmd_bits`, `param_bits` | int | 8 | DBI 命令/參數位寬（少數面板不同） |
+| `use_dma2d` | bool | True | `True` = DMA2D 拷貝，`False` = 退回 CPU 拷貝 |
+| `queue_depth` | int | 4 | 非同步寫入管線深度（1-8）；越大越吃記憶體、管線越深 |
+
+> **所有面板相關參數都從 Python 層輸入** —— 換面板不需要改 C module。
+> 面板 init 命令序列（`cmd()`）、reset/背光腳位、DSI PHY LDO 也都在
+> Python 層處理（見 `test_dsi.py`）。
 
 driver 內部自動配置整張畫面的 frame buffer；`frame_buffer(idx)` 回傳零拷貝的
 `bytearray` 視圖。`write()` 是非同步的——bus 會把資料複製進 frame buffer，
@@ -142,10 +154,57 @@ bus.wait(tid)
 
 fb = bus.frame_buffer(0)         # 內部 fb 的零拷貝視圖
 memoryview(fb)[:2] = b'\xf8\x00' # 直接寫進 framebuffer
+bus.flush()                      # ⚠ 把髒 L2 cache line 寫回 PSRAM
 
 bus.set_pattern(1)               # 內建測試圖案（0=無,1=直條,2=橫條,3=BER）
 bus.set_pattern(0)               # 恢復正常顯示
 ```
+
+### DSIBus frame buffer 直寫與雙緩衝（ESP32-P4）
+
+**⚠️ 透過 `frame_buffer(idx)` 直寫後一定要 `flush()`。**
+
+ESP32-P4 的 frame buffer 在 PSRAM。CPU 寫入走 write-back L2 cache，
+但 DPI DMA 是**直接讀 PSRAM（不經 cache）**。沒有 `esp_cache_msync()`
+的話，DMA 會一直讀到「還沒寫回」的舊資料 —— 症狀就是殘留 / 黑帶 /
+閃爍。`flush()` 把指定區域的髒 cache line 寫回 PSRAM（與 esp_lcd
+driver 內部做的操作相同），所以每次直寫 fb 之後都要呼叫：
+
+```python
+fb = bus.frame_buffer(0)
+fill_screen(fb, color)   # CPU 寫入 PSRAM（先進 cache）
+bus.flush()              # 寫回，DPI DMA 才看得到
+```
+
+**撕裂規則（`fb_count` 語義）：**
+
+| fb_count | `write(buf)` 外部 buffer | `frame_buffer()` 直寫 |
+|---|---|---|
+| 1 | DMA2D 拷進「顯示中」的 fb → 拷貝期間會撕裂（約 ms 級） | 寫正在被掃描的 buffer 必撕裂；單緩衝的物理限制 |
+| 2+ | 同上 —— 外部 buffer 一律落在「顯示中」的 fb | 要完全不撕裂請用下面的交換模式 |
+
+**不撕裂的雙緩衝**（需 `fb_count=2`）：esp_lcd P4 driver 每塊 fb 各有一條
+DMA link list，當 `draw_bitmap()` 的 draw buffer **是內部 fb** 時（不做拷貝，
+只 cache writeback + 切換指標），會在**幀邊界**自動切到那塊 fb。所以用法是：
+在「目前沒在顯示」的那塊 fb 畫完整幀，再把該 fb view 丟給 `write()`：
+
+```python
+fb0 = bus.frame_buffer(0)
+fb1 = bus.frame_buffer(1)
+
+while True:
+    draw_full_frame(fb1, frame_a)   # fb0 顯示中，畫 fb1
+    bus.write(fb1); bus.wait_all()  # msync + 下一幀邊界切換
+    draw_full_frame(fb0, frame_b)   # fb1 顯示中，畫 fb0
+    bus.write(fb0); bus.wait_all()
+```
+
+規則：每次都要**整幀**更新（或維持兩塊 fb 內容同步），否則切換過去後，
+沒畫到的區域顯示的是那一塊的舊內容 —— 多 fb + 部分更新會每幀在兩塊
+舊內容之間翻動。
+
+`test_dsi.py` 涵蓋全部三種路徑：直寫 + `flush()`（純色/漸層）、
+外部 buffer 的異步 `write()`、以及雙緩衝不撕裂示範。
 
 ---
 
@@ -160,7 +219,7 @@ bus.set_pattern(0)               # 恢復正常顯示
 | 回傳 | `trans_id` (int) | `None` |
 | cmd/addr phase | 無 | 有（8-bit cmd + 24-bit addr） |
 | 同步？ | 非同步，立刻返回 | 同步，完成才返回 |
-| 隊列深度 | 最多 4（`SPI_DMA_QUEUE_DEPTH`） | 不走隊列 |
+| 隊列深度 | 最多 `queue_depth`（預設 8） | 不走隊列 |
 | 用途 | 大筆像素資料 | LCD 命令、像素前導 |
 
 **參數說明：**
@@ -253,11 +312,11 @@ bus.wait(tid_b)
 
 ### Queue Full
 
-第 5 筆不阻塞，直接拋 `RuntimeError("queue full")`：
+第 `queue_depth + 1` 筆不阻塞，直接拋 `RuntimeError("queue full")`（SPI 預設深度 8）：
 
 ```python
 try:
-    for _ in range(5):
+    for _ in range(9):
         bus.write(bytearray(64))
 except RuntimeError as e:
     print(e)  # "queue full"
@@ -265,7 +324,10 @@ except RuntimeError as e:
 
 ### Queue Depth
 
-`SPI_DMA_QUEUE_DEPTH = 4` 不是硬體 DMA 限制，是為省記憶體（每 slot ~28 bytes）。可改 `esp32_include/spi_bus.h`。4 對 `write → wait` 串列場景已足夠。
+`queue_depth` 不是硬體 DMA 限制，是為省記憶體（每 slot ~28 bytes）。可透過
+建構子調整（各 bus 皆支援，範圍 1-8）：`SPIBus(..., queue_depth=8)`、
+`I80Bus(..., queue_depth=4)`、`RGBBus(..., queue_depth=2)`、
+`DSIBus(..., queue_depth=4)`。8 對 `write → wait` 串列場景已足夠。
 
 ### 非阻塞查詢
 
@@ -314,7 +376,7 @@ test_bus.run_all()
 
 | # | 測試 | 說明 | 斷言 |
 |---|------|------|------|
-| 1 | `test_spi` | SPI 初始化、寫入、4 層隊列、queue-full、deinit | 11 |
+| 1 | `test_spi` | SPI 初始化、寫入、queue_depth 隊列、queue-full、deinit | 11 |
 | 2 | `test_spi_multilane` | 1/2/4/8 線自動檢測 | 4 |
 | 3 | `test_spi_official` | 全雙工、`readinto()` | 5 |
 | 4 | `test_speed` | 吞吐量基準（1/2/4 線、40/80 MHz） | 純輸出 |

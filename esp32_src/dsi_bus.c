@@ -6,6 +6,7 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_heap_caps.h"
+#include "esp_cache.h"
 
 #include "py/runtime.h"
 #include "py/objarray.h"
@@ -20,11 +21,11 @@ static mp_lcd_dsi_bus_obj_t *s_last_dsi = NULL;
 static bool on_color_trans_done(esp_lcd_panel_handle_t panel,
                                 esp_lcd_dpi_panel_event_data_t *edata, void *ctx) {
     mp_lcd_dsi_bus_obj_t *self = (mp_lcd_dsi_bus_obj_t *)ctx;
-    for (int i = 0; i < DSI_DMA_QUEUE_DEPTH; i++) {
+    for (int i = 0; i < self->queue_depth; i++) {
         if (self->ref_bufs[i] != mp_const_none && !self->done_flags[i]) {
             self->done_flags[i] = true;
             self->ref_bufs[i] = mp_const_none;
-            self->queue_head = (self->queue_head + 1) % DSI_DMA_QUEUE_DEPTH;
+            self->queue_head = (self->queue_head + 1) % self->queue_depth;
             self->queue_count--;
             break;
         }
@@ -57,6 +58,9 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         ARG_hsync_pulse_width, ARG_hsync_back_porch, ARG_hsync_front_porch,
         ARG_vsync_pulse_width, ARG_vsync_back_porch, ARG_vsync_front_porch,
         ARG_in_color_format, ARG_fb_count, ARG_rst, ARG_virtual_channel,
+        ARG_cmd_bits, ARG_param_bits,
+        ARG_hsync_idle_pixel, ARG_vsync_idle_line,
+        ARG_use_dma2d, ARG_queue_depth,
     };
     static const mp_arg_t allowed[] = {
         { MP_QSTR_lanes,              MP_ARG_INT | MP_ARG_REQUIRED },
@@ -74,6 +78,12 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         { MP_QSTR_fb_count,           MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 2} },
         { MP_QSTR_rst,                MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
         { MP_QSTR_virtual_channel,    MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
+        { MP_QSTR_cmd_bits,           MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 8} },
+        { MP_QSTR_param_bits,         MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 8} },
+        { MP_QSTR_hsync_idle_pixel,   MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
+        { MP_QSTR_vsync_idle_line,    MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
+        { MP_QSTR_use_dma2d,          MP_ARG_BOOL | MP_ARG_KW_ONLY, {.u_bool = true} },
+        { MP_QSTR_queue_depth,        MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = DSI_DEFAULT_QUEUE_DEPTH} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed), allowed, args);
@@ -89,6 +99,10 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     int nfbs = args[ARG_fb_count].u_int;
     if (nfbs < 1 || nfbs > DSI_MAX_FBS)
         mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("fb_count must be 1-%d"), DSI_MAX_FBS);
+
+    int qdepth = args[ARG_queue_depth].u_int;
+    if (qdepth < 1 || qdepth > DSI_MAX_QUEUE_DEPTH)
+        mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("queue_depth must be 1-%d"), DSI_MAX_QUEUE_DEPTH);
 
     // only one DSI controller on the chip, tear down a previous instance if any
     if (s_last_dsi) {
@@ -106,6 +120,7 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     self->bits_per_pixel = bpp;
     self->num_fbs = nfbs;
     self->fb_size = (size_t)self->panel_w * self->panel_h * bpp / 8;
+    self->queue_depth = qdepth;
 
     esp_err_t ret;
 
@@ -120,8 +135,8 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
 
     esp_lcd_dbi_io_config_t dbi = {
         .virtual_channel = (uint8_t)args[ARG_virtual_channel].u_int,
-        .lcd_cmd_bits = 8,
-        .lcd_param_bits = 8,
+        .lcd_cmd_bits = (uint8_t)args[ARG_cmd_bits].u_int,
+        .lcd_param_bits = (uint8_t)args[ARG_param_bits].u_int,
     };
     ret = esp_lcd_new_panel_io_dbi(self->bus_handle, &dbi, &self->dbi_io);
     if (ret != ESP_OK) goto err_bus;
@@ -143,12 +158,14 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
             .hsync_pulse_width = (uint32_t)args[ARG_hsync_pulse_width].u_int,
             .hsync_back_porch  = (uint32_t)args[ARG_hsync_back_porch].u_int,
             .hsync_front_porch = (uint32_t)args[ARG_hsync_front_porch].u_int,
+            .hsync_idle_pixel  = (uint32_t)args[ARG_hsync_idle_pixel].u_int,
             .vsync_pulse_width = (uint32_t)args[ARG_vsync_pulse_width].u_int,
             .vsync_back_porch  = (uint32_t)args[ARG_vsync_back_porch].u_int,
             .vsync_front_porch = (uint32_t)args[ARG_vsync_front_porch].u_int,
+            .vsync_idle_line   = (uint32_t)args[ARG_vsync_idle_line].u_int,
         },
         .flags = {
-            .use_dma2d = true,    // ESP32-P4 有 DMA2D, 加速 write() 的 buffer copy
+            .use_dma2d = args[ARG_use_dma2d].u_bool,
         },
     };
     ret = esp_lcd_new_panel_dpi(self->bus_handle, &dc, &self->dpi_panel);
@@ -237,7 +254,7 @@ static mp_obj_t dsi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     if (self->dpi_panel == NULL) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("bus deinitialized"));
     }
-    if (self->queue_count >= DSI_DMA_QUEUE_DEPTH)
+    if (self->queue_count >= self->queue_depth)
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
 
     int idx = self->queue_tail;
@@ -257,7 +274,7 @@ static mp_obj_t dsi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
         mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("draw_bitmap failed err=0x%x"), ret);
     }
 
-    self->queue_tail = (self->queue_tail + 1) % DSI_DMA_QUEUE_DEPTH;
+    self->queue_tail = (self->queue_tail + 1) % self->queue_depth;
     self->queue_count++;
     return mp_obj_new_int(idx + 1);
 }
@@ -325,6 +342,53 @@ static mp_obj_t dsi_frame_buffer(mp_obj_t self_in, mp_obj_t idx_in) {
 static MP_DEFINE_CONST_FUN_OBJ_2(dsi_frame_buffer_obj, dsi_frame_buffer);
 
 
+static mp_obj_t dsi_flush(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_self, ARG_idx, ARG_x, ARG_y, ARG_w, ARG_h };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_self, MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_idx,  MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_x,    MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
+        { MP_QSTR_y,    MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
+        { MP_QSTR_w,    MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
+        { MP_QSTR_h,    MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
+
+    mp_lcd_dsi_bus_obj_t *self = (mp_lcd_dsi_bus_obj_t *)args[ARG_self].u_obj;
+    // ⚠ deinit 後 dpi_panel 為 NULL，直接使用會 use-after-free
+    if (self->dpi_panel == NULL) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("bus deinitialized"));
+    }
+    int idx = args[ARG_idx].u_int;
+    if (idx < 0 || idx >= self->num_fbs || self->fbs[idx] == NULL)
+        mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("frame buffer index out of range"));
+
+    int x = args[ARG_x].u_int;
+    int y = args[ARG_y].u_int;
+    int w = args[ARG_w].u_int ? args[ARG_w].u_int : self->panel_w;
+    int h = args[ARG_h].u_int ? args[ARG_h].u_int : self->panel_h;
+
+    // clip 到面板範圍（與 esp_lcd_dpi_panel_draw_bitmap 同慣例）
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x + w > self->panel_w) w = self->panel_w - x;
+    if (y + h > self->panel_h) h = self->panel_h - y;
+    if (w <= 0 || h <= 0) return mp_const_none;
+
+    // ⚠ ESP32-P4：frame buffer 在 PSRAM，CPU 寫入走 write-back L2 cache，
+    // 而 DPI DMA 是直接讀 PSRAM（不經 cache）。frame_buffer() 零拷貝直寫
+    // 之後若不 esp_cache_msync() 把髒行寫回，DMA 會一直讀到舊內容 —
+    // 症狀就是「殘留/黑帶/閃爍」。flush() 就是把指定區域的髒 cache line
+    // 寫回 PSRAM（DIR_C2M），與 esp_lcd DPI driver 內部做法相同。
+    uint8_t *start = (uint8_t *)self->fbs[idx] + (y * self->panel_w + x) * self->bits_per_pixel / 8;
+    size_t size = (size_t)h * self->panel_w * self->bits_per_pixel / 8;
+    esp_cache_msync(start, size, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(dsi_flush_obj, 1, dsi_flush);
+
+
 static mp_obj_t dsi_is_busy(mp_obj_t self_in) {
     return mp_obj_new_bool(((mp_lcd_dsi_bus_obj_t *)self_in)->queue_count > 0);
 }
@@ -356,7 +420,7 @@ static mp_obj_t dsi_wait(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_a
     int to  = args[ARG_timeout_ms].u_int;
     int idx = tid - 1;
 
-    if (idx < 0 || idx >= DSI_DMA_QUEUE_DEPTH) return mp_const_false;
+    if (idx < 0 || idx >= self->queue_depth) return mp_const_false;
     if (self->done_flags[idx]) return mp_const_true;
 
     mp_uint_t deadline = mp_hal_ticks_ms() + (to < 0 ? 10000 : to);
@@ -390,7 +454,7 @@ static mp_obj_t dsi_wait_all(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
     // 每幀 flush 都會呼叫 wait_all，full GC 在 PSRAM heap + 大 frame buffer
     // 上可達 ~200ms。僅在逾時殘留（queue 未清空）時才強制釋放 + gc_collect。
     if (self->queue_count > 0) {
-        for (int i = 0; i < DSI_DMA_QUEUE_DEPTH; i++) {
+        for (int i = 0; i < self->queue_depth; i++) {
             self->ref_bufs[i] = mp_const_none;
             self->done_flags[i] = true;
         }
@@ -407,7 +471,7 @@ static mp_obj_t dsi_deinit(mp_obj_t self_in) {
     if (s_last_dsi == self) s_last_dsi = NULL;
     dsi_deinit_hardware(self);
     // ⚠ 修復：清 ref_bufs（原先殘留釘住 buffer 引用 → GC 洩漏）
-    for (int i = 0; i < DSI_DMA_QUEUE_DEPTH; i++) {
+    for (int i = 0; i < self->queue_depth; i++) {
         self->ref_bufs[i] = mp_const_none;
         self->done_flags[i] = true;
     }
@@ -426,6 +490,7 @@ static const mp_rom_map_elem_t dsi_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_wait_all),     MP_ROM_PTR(&dsi_wait_all_obj) },
     { MP_ROM_QSTR(MP_QSTR_lane_count),   MP_ROM_PTR(&dsi_lane_count_obj) },
     { MP_ROM_QSTR(MP_QSTR_frame_buffer), MP_ROM_PTR(&dsi_frame_buffer_obj) },
+    { MP_ROM_QSTR(MP_QSTR_flush),        MP_ROM_PTR(&dsi_flush_obj) },
     { MP_ROM_QSTR(MP_QSTR_set_pattern),  MP_ROM_PTR(&dsi_set_pattern_obj) },
     { MP_ROM_QSTR(MP_QSTR_deinit),       MP_ROM_PTR(&dsi_deinit_obj) },
     { MP_ROM_QSTR(MP_QSTR___del__),      MP_ROM_PTR(&dsi_deinit_obj) },
