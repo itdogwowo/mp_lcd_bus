@@ -109,7 +109,6 @@ lcd_bus.DSIBus(lanes, width, height, lane_bit_rate_mbps, *,
                dpi_clk_mhz=30.0,
                hsync_pulse_width=1, hsync_back_porch=10, hsync_front_porch=10,
                vsync_pulse_width=1, vsync_back_porch=10, vsync_front_porch=10,
-               hsync_idle_pixel=0, vsync_idle_line=0,
                in_color_format=16, fb_count=2, rst=-1,
                virtual_channel=0,
                cmd_bits=8, param_bits=8,
@@ -123,7 +122,6 @@ lcd_bus.DSIBus(lanes, width, height, lane_bit_rate_mbps, *,
 | `lane_bit_rate_mbps` | float | 必填 | DSI PHY lane bit rate（Mbps，如 1000） |
 | `dpi_clk_mhz` | float | 30.0 | 像素（DPI）時脈 MHz |
 | `hsync/vsync_*` | int | 1/10/10 | video timing（porch 與 pulse width，單位 px/行） |
-| `hsync_idle_pixel`, `vsync_idle_line` | int | 0 | timing 的 idle 空閒週期（部分面板需非 0） |
 | `in_color_format` | int | 16 | `16` = RGB565，`24` = RGB888 |
 | `fb_count` | int | 2 | 內部 frame buffer 數（1-3），由 driver 配置於 PSRAM |
 | `rst` | int | -1 | 面板硬體 reset GPIO（`-1` = 不使用） |

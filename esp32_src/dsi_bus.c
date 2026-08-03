@@ -59,7 +59,6 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         ARG_vsync_pulse_width, ARG_vsync_back_porch, ARG_vsync_front_porch,
         ARG_in_color_format, ARG_fb_count, ARG_rst, ARG_virtual_channel,
         ARG_cmd_bits, ARG_param_bits,
-        ARG_hsync_idle_pixel, ARG_vsync_idle_line,
         ARG_use_dma2d, ARG_queue_depth,
     };
     static const mp_arg_t allowed[] = {
@@ -80,8 +79,6 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         { MP_QSTR_virtual_channel,    MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
         { MP_QSTR_cmd_bits,           MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 8} },
         { MP_QSTR_param_bits,         MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 8} },
-        { MP_QSTR_hsync_idle_pixel,   MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
-        { MP_QSTR_vsync_idle_line,    MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
         { MP_QSTR_use_dma2d,          MP_ARG_BOOL | MP_ARG_KW_ONLY, {.u_bool = true} },
         { MP_QSTR_queue_depth,        MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = DSI_DEFAULT_QUEUE_DEPTH} },
     };
@@ -158,11 +155,9 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
             .hsync_pulse_width = (uint32_t)args[ARG_hsync_pulse_width].u_int,
             .hsync_back_porch  = (uint32_t)args[ARG_hsync_back_porch].u_int,
             .hsync_front_porch = (uint32_t)args[ARG_hsync_front_porch].u_int,
-            .hsync_idle_pixel  = (uint32_t)args[ARG_hsync_idle_pixel].u_int,
             .vsync_pulse_width = (uint32_t)args[ARG_vsync_pulse_width].u_int,
             .vsync_back_porch  = (uint32_t)args[ARG_vsync_back_porch].u_int,
             .vsync_front_porch = (uint32_t)args[ARG_vsync_front_porch].u_int,
-            .vsync_idle_line   = (uint32_t)args[ARG_vsync_idle_line].u_int,
         },
         .flags = {
             .use_dma2d = args[ARG_use_dma2d].u_bool,
