@@ -18,6 +18,18 @@ import lcd_bus
 | `lcd_bus.DSIBus` | `esp_lcd_mipi_dsi` (ESP32-P4 only) | ✅ | ✅ 4-deep |
 | `lcd_bus.I2CBus` | `esp_lcd_i2c` | ❌ | ❌ blocking |
 
+## Off-Bus Control Pins
+
+All control pins are **optional** (default `-1` = not managed). Pass a GPIO number to let C/esp_lcd manage it, or leave `-1` to control it externally with `machine.Pin`.
+
+| Bus | Pin | Managed by | Default | Notes |
+|---|---|---|---|---|
+| `SPIBus` | dc/cs | — (external only) | — | Pure SPI bus; dc/cs handled by user/adapter |
+| `I80Bus` | `dc` | esp_lcd | `-1` | **Strongly recommended** — I80 needs dc for cmd/data switching |
+| `I80Bus` | `cs` | esp_lcd | `-1` | |
+| `RGBBus` | `disp` | esp_lcd | `-1` | Display enable |
+| `DSIBus` | `rst` | C module | `-1` | esp_lcd DPI panel has no reset_gpio support |
+
 ## Unified API
 
 All buses expose the same methods:
@@ -105,7 +117,7 @@ lcd_bus.DSIBus(lanes, width, height, lane_bit_rate_mbps, *,
                dpi_clk_mhz=30.0,
                hsync_pulse_width=1, hsync_back_porch=10, hsync_front_porch=10,
                vsync_pulse_width=1, vsync_back_porch=10, vsync_front_porch=10,
-               in_color_format=16, fb_count=2, reset_pin=-1,
+               in_color_format=16, fb_count=2, rst=-1,
                virtual_channel=0)
 ```
 
@@ -118,14 +130,14 @@ lcd_bus.DSIBus(lanes, width, height, lane_bit_rate_mbps, *,
 | `hsync/vsync_*` | int | 1/10/10 | Video timing (porches & pulse width, in px/lines) |
 | `in_color_format` | int | 16 | `16` = RGB565, `24` = RGB888 |
 | `fb_count` | int | 2 | Number of internal frame buffers (1-3), allocated in PSRAM by the driver |
-| `reset_pin` | int | -1 | Panel hardware reset GPIO (`-1` = not used) |
+| `rst` | int | -1 | Panel hardware reset GPIO (`-1` = not used) |
 | `virtual_channel` | int | 0 | DSI virtual channel (0-3) |
 
 The driver allocates screen-sized frame buffers internally; `frame_buffer(idx)` returns a zero-copy `bytearray` view of one. Writes are asynchronous — the bus copies the buffer into a frame buffer, and `write()` returns a `trans_id` you can `wait()` on:
 
 ```python
 bus = lcd_bus.DSIBus(lanes=2, width=800, height=480,
-                     lane_bit_rate_mbps=1000, reset_pin=20)
+                     lane_bit_rate_mbps=1000, rst=20)
 
 bus.cmd(0x11)                    # SLPOUT (no params)
 bus.cmd(0x36, b'\x00')           # MADCTL

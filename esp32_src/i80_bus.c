@@ -48,12 +48,19 @@ static mp_obj_t i80_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     static const mp_arg_t allowed[] = {
         { MP_QSTR_data, MP_ARG_OBJ | MP_ARG_REQUIRED },
         { MP_QSTR_wr,   MP_ARG_INT | MP_ARG_REQUIRED },
-        { MP_QSTR_dc,   MP_ARG_INT | MP_ARG_REQUIRED },
+        { MP_QSTR_dc,   MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
         { MP_QSTR_cs,   MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
         { MP_QSTR_freq, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 10000000} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed), allowed, args);
+
+    // dc 是 I80 bus 的命令/資料切換腳,強烈建議填寫;不填 esp_lcd 可能無法建立 bus
+    if (args[ARG_dc].u_int < 0) {
+        mp_printf(&mp_plat_print,
+            "Warning: I80 dc GPIO not specified (-1). I80 bus requires dc for cmd/data "
+            "switching; esp_lcd may fail to initialize. Pass dc=<gpio> to silence this.\n");
+    }
 
     size_t n;
     mp_obj_t *items;
@@ -289,10 +296,11 @@ static MP_DEFINE_CONST_FUN_OBJ_KW(i80_wait_all_obj, 1, i80_wait_all);
 
 static void i80_reset_gpios(mp_lcd_i80_bus_obj_t *self) {
     // 把用過的 I80 腳全部恢復成 floating input，避免 soft reboot 後殘留
-    int pins[18];
+    int pins[19];
     int p = 0;
     pins[p++] = self->wr_pin;
-    pins[p++] = self->dc_pin;
+    if (self->dc_pin >= 0) pins[p++] = self->dc_pin;
+    if (self->cs_pin >= 0) pins[p++] = self->cs_pin;   // ⚠ 修復：原先遺漏 cs
     for (int i = 0; i < 16 && i < self->lane_count; i++) {
         if (self->data_pins[i] >= 0) pins[p++] = self->data_pins[i];
     }

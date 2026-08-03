@@ -18,6 +18,18 @@ import lcd_bus
 | `lcd_bus.DSIBus` | `esp_lcd_mipi_dsi`（僅 ESP32-P4） | ✅ | ✅ 4 層隊列 |
 | `lcd_bus.I2CBus` | `esp_lcd_i2c` | ❌ | ❌ 阻塞式 |
 
+## 總線外控制腳
+
+所有控制腳均為**選填**（預設 `-1` = 不管理）。傳入 GPIO 編號讓 C/esp_lcd 管理，或留 `-1` 自行用 `machine.Pin` 外部控制。
+
+| Bus | 腳位 | 管理者 | 預設 | 備註 |
+|---|---|---|---|---|
+| `SPIBus` | dc/cs | —（僅外部） | — | 純 SPI bus；dc/cs 由使用者/adapter 處理 |
+| `I80Bus` | `dc` | esp_lcd | `-1` | **強烈建議填寫** — I80 需要 dc 切換命令/資料 |
+| `I80Bus` | `cs` | esp_lcd | `-1` | |
+| `RGBBus` | `disp` | esp_lcd | `-1` | 顯示使能 |
+| `DSIBus` | `rst` | C module | `-1` | esp_lcd DPI panel 不支援 reset_gpio |
+
 ## 統一 API
 
 所有 bus 共用相同方法：
@@ -96,7 +108,7 @@ lcd_bus.DSIBus(lanes, width, height, lane_bit_rate_mbps, *,
                dpi_clk_mhz=30.0,
                hsync_pulse_width=1, hsync_back_porch=10, hsync_front_porch=10,
                vsync_pulse_width=1, vsync_back_porch=10, vsync_front_porch=10,
-               in_color_format=16, fb_count=2, reset_pin=-1,
+               in_color_format=16, fb_count=2, rst=-1,
                virtual_channel=0)
 ```
 
@@ -109,7 +121,7 @@ lcd_bus.DSIBus(lanes, width, height, lane_bit_rate_mbps, *,
 | `hsync/vsync_*` | int | 1/10/10 | video timing（porch 與 pulse width，單位 px/行） |
 | `in_color_format` | int | 16 | `16` = RGB565，`24` = RGB888 |
 | `fb_count` | int | 2 | 內部 frame buffer 數（1-3），由 driver 配置於 PSRAM |
-| `reset_pin` | int | -1 | 面板硬體 reset GPIO（`-1` = 不使用） |
+| `rst` | int | -1 | 面板硬體 reset GPIO（`-1` = 不使用） |
 | `virtual_channel` | int | 0 | DSI virtual channel（0-3） |
 
 driver 內部自動配置整張畫面的 frame buffer；`frame_buffer(idx)` 回傳零拷貝的
@@ -118,7 +130,7 @@ driver 內部自動配置整張畫面的 frame buffer；`frame_buffer(idx)` 回�
 
 ```python
 bus = lcd_bus.DSIBus(lanes=2, width=800, height=480,
-                     lane_bit_rate_mbps=1000, reset_pin=20)
+                     lane_bit_rate_mbps=1000, rst=20)
 
 bus.cmd(0x11)                    # SLPOUT（無參數）
 bus.cmd(0x36, b'\x00')           # MADCTL

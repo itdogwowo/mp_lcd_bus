@@ -56,7 +56,7 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         ARG_lane_bit_rate_mbps, ARG_dpi_clk_mhz,
         ARG_hsync_pulse_width, ARG_hsync_back_porch, ARG_hsync_front_porch,
         ARG_vsync_pulse_width, ARG_vsync_back_porch, ARG_vsync_front_porch,
-        ARG_in_color_format, ARG_fb_count, ARG_reset_pin, ARG_virtual_channel,
+        ARG_in_color_format, ARG_fb_count, ARG_rst, ARG_virtual_channel,
     };
     static const mp_arg_t allowed[] = {
         { MP_QSTR_lanes,              MP_ARG_INT | MP_ARG_REQUIRED },
@@ -72,7 +72,7 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         { MP_QSTR_vsync_front_porch,  MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 10} },
         { MP_QSTR_in_color_format,    MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 16} },
         { MP_QSTR_fb_count,           MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 2} },
-        { MP_QSTR_reset_pin,          MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
+        { MP_QSTR_rst,                MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
         { MP_QSTR_virtual_channel,    MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
@@ -102,7 +102,7 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     self->lane_count = lanes;
     self->panel_w = args[ARG_width].u_int;
     self->panel_h = args[ARG_height].u_int;
-    self->reset_pin = args[ARG_reset_pin].u_int;
+    self->reset_pin = args[ARG_rst].u_int;
     self->bits_per_pixel = bpp;
     self->num_fbs = nfbs;
     self->fb_size = (size_t)self->panel_w * self->panel_h * bpp / 8;
@@ -112,6 +112,7 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     esp_lcd_dsi_bus_config_t bc = {
         .bus_id = 0,
         .num_data_lanes = (uint8_t)lanes,
+        .phy_clk_src = MIPI_DSI_PHY_CLK_SRC_DEFAULT,
         .lane_bit_rate_mbps = mp_obj_get_float(args[ARG_lane_bit_rate_mbps].u_obj),
     };
     ret = esp_lcd_new_dsi_bus(&bc, &self->bus_handle);
@@ -133,6 +134,7 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         .virtual_channel = (uint8_t)args[ARG_virtual_channel].u_int,
         .dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
         .dpi_clock_freq_mhz = dpi_clk_mhz,
+        .pixel_format = (bpp == 24) ? LCD_COLOR_PIXEL_FORMAT_RGB888 : LCD_COLOR_PIXEL_FORMAT_RGB565,
         .in_color_format = (bpp == 24) ? LCD_COLOR_FMT_RGB888 : LCD_COLOR_FMT_RGB565,
         .num_fbs = (uint8_t)nfbs,
         .video_timing = {
@@ -144,6 +146,9 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
             .vsync_pulse_width = (uint32_t)args[ARG_vsync_pulse_width].u_int,
             .vsync_back_porch  = (uint32_t)args[ARG_vsync_back_porch].u_int,
             .vsync_front_porch = (uint32_t)args[ARG_vsync_front_porch].u_int,
+        },
+        .flags = {
+            .use_dma2d = true,    // ESP32-P4 有 DMA2D, 加速 write() 的 buffer copy
         },
     };
     ret = esp_lcd_new_panel_dpi(self->bus_handle, &dc, &self->dpi_panel);
@@ -163,6 +168,7 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     if (ret != ESP_OK) goto err_panel;
 
     // optional hardware reset for the panel
+    // (esp_lcd DPI panel has no reset_gpio support, so we manage it manually)
     if (self->reset_pin >= 0) {
         gpio_config_t gc = {
             .mode = GPIO_MODE_OUTPUT,
@@ -175,8 +181,9 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         mp_hal_delay_ms(50);
     }
 
-    ret = esp_lcd_panel_reset(self->dpi_panel);
-    if (ret != ESP_OK) goto err_panel;
+    // Note: esp_lcd_panel_reset() is NOT called — DPI panel driver doesn't
+    // register a .reset callback and would return ESP_ERR_NOT_SUPPORTED.
+    // The hardware reset above (if rst>=0) is the only reset mechanism.
     ret = esp_lcd_panel_init(self->dpi_panel);
     if (ret != ESP_OK) goto err_panel;
 
@@ -190,6 +197,14 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     return MP_OBJ_FROM_PTR(self);
 
 err_panel:
+    // ⚠ 修復：reset GPIO 已被配置為 OUTPUT，錯誤路徑需釋放回 INPUT
+    if (self->reset_pin >= 0) {
+        gpio_config_t gc = {
+            .mode = GPIO_MODE_INPUT,
+            .pin_bit_mask = 1ULL << self->reset_pin,
+        };
+        gpio_config(&gc);
+    }
     if (self->dpi_panel) esp_lcd_panel_del(self->dpi_panel);
 err_io:
     if (self->dbi_io) esp_lcd_panel_io_del(self->dbi_io);
