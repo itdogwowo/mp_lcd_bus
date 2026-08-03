@@ -52,6 +52,11 @@ endif(ESP_PLATFORM)
 # a stub type that raises NotImplementedError, so no manual build-system routing
 # is needed per chip.
 
+# NOTE: DSI DPI panels need high PSRAM bandwidth (200MHz + L2 cache) to avoid
+# underrun. When building with mp_Make-Tools, the required sdkconfig keys for
+# each chip are declared in sdkconfig.require.json (next to this file) and
+# injected automatically by the build tool — no manual sdkconfig editing needed.
+
 
 # Add our source files to the lib
 target_sources(usermod_lcd_bus INTERFACE ${SOURCES})

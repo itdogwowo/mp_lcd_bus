@@ -333,6 +333,25 @@ CMake（ESP-IDF）：將本 repo 加入為 User C Module。
 
 非 ESP32：stub 拋 `NotImplementedError`。
 
+### DSI 建置需求（ESP32-P4）
+
+MIPI DSI DPI 面板持續從 PSRAM 的 frame buffer 串流像素資料。若 PSRAM 頻寬不足，
+DPI 控制器會回報 underrun（`can't fetch data from external memory fast enough`），
+導致螢幕閃爍。
+
+使用 **mp_Make-Tools** 建置時，所需的 sdkconfig 配置宣告於
+[`sdkconfig.require.json`](sdkconfig.require.json)，建置工具會依據目標晶片
+自動注入——無需手動編輯 sdkconfig。
+
+| Key | 原因 |
+|---|---|
+| `CONFIG_SPIRAM_SPEED_200M` | PSRAM 跑 200MHz（預設 80MHz 太慢，DSI 不夠用） |
+| `CONFIG_CACHE_L2_CACHE_256KB` | L2 cache，提升 DMA 讀取 PSRAM 效率 |
+| `CONFIG_CACHE_L2_CACHE_LINE_128B` | L2 cache line 大小（需搭配） |
+| `CONFIG_SPIRAM_XIP_FROM_PSRAM` | 程式從 PSRAM 執行，釋放內部 RAM |
+
+若不用 mp_Make-Tools 建置，需手動將這些 key 加到 `sdkconfig.defaults`。
+
 ## License
 
 MIT

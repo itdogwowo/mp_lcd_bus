@@ -343,6 +343,25 @@ raises `NotImplementedError`, so no per-chip build configuration is needed.
 
 Non-ESP32 ports: stubs raise `NotImplementedError`.
 
+### DSI Build Requirements (ESP32-P4)
+
+The MIPI DSI DPI panel continuously streams pixel data from a frame buffer in PSRAM.
+Without sufficient PSRAM bandwidth, the DPI controller reports underrun errors
+(`can't fetch data from external memory fast enough`) and the screen flickers.
+
+When building with **mp_Make-Tools**, the required sdkconfig keys are declared in
+[`sdkconfig.require.json`](sdkconfig.require.json) and injected automatically based
+on the target chip — no manual sdkconfig editing needed.
+
+| Key | Why |
+|---|---|
+| `CONFIG_SPIRAM_SPEED_200M` | PSRAM at 200 MHz (default is 80 MHz, too slow for DSI) |
+| `CONFIG_CACHE_L2_CACHE_256KB` | L2 cache for efficient DMA reads from PSRAM |
+| `CONFIG_CACHE_L2_CACHE_LINE_128B` | L2 cache line size (must match) |
+| `CONFIG_SPIRAM_XIP_FROM_PSRAM` | Execute code from PSRAM, freeing internal RAM |
+
+If building without mp_Make-Tools, add these keys to your `sdkconfig.defaults` manually.
+
 ## License
 
 MIT
