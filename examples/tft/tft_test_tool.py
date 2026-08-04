@@ -187,14 +187,14 @@ def _hsv(h, s=100, v=100):
     return ((int(r * 31) & 0x1F) << 11) | ((int(g * 63) & 0x3F) << 5) | (int(b * 31) & 0x1F)
 
 
+def _solid_frame(color565):
+    """整幀單色 buffer — bytes 重複是 C 層速度 (逐字節 Python 迴圈在 MP 上慢百倍)"""
+    return bytes([color565 >> 8, color565 & 0xFF]) * (WIDTH * HEIGHT)
+
+
 def _fill_solid(color565):
     """全螢幕填色 — 組整幀 → blit (整頁原子更新, 零撕裂)"""
-    buf = bytearray(WIDTH * HEIGHT * 2)
-    hi, lo = color565 >> 8, color565 & 0xFF
-    for i in range(0, len(buf), 2):
-        buf[i] = hi
-        buf[i + 1] = lo
-    _lcd.blit(buf)
+    _lcd.blit(_solid_frame(color565))
 
 
 def _clear():
@@ -225,14 +225,12 @@ def color_bars():
     bar_h = HEIGHT // 8
     palette = [0xF800, 0x07E0, 0x001F, 0xFFFF, 0xFFE0, 0x07FF, 0xF81F, 0x0000]
     buf = bytearray(WIDTH * HEIGHT * 2)
+    mv = memoryview(buf)
+    rowbytes = WIDTH * 2
     for i, c in enumerate(palette):
         y0, y1 = i * bar_h, (i + 1) * bar_h if i < 7 else HEIGHT
-        hi, lo = c >> 8, c & 0xFF
-        for y in range(y0, y1):
-            off = y * WIDTH * 2
-            for x in range(0, WIDTH * 2, 2):
-                buf[off + x] = hi
-                buf[off + x + 1] = lo
+        band = bytes([c >> 8, c & 0xFF]) * (WIDTH * (y1 - y0))   # C 速度填整帶
+        mv[y0 * rowbytes:y1 * rowbytes] = band
     _lcd.blit(buf)
     time.sleep_ms(1200)
     print("color_bars done")
@@ -260,20 +258,26 @@ def gradient():
 
 
 def checkerboard():
-    """棋盤格 (40x40) — 組整幀 → blit (整頁原子)"""
+    """棋盤格 (40x40) — 組整幀 → blit (整頁原子)。
+    只建兩種行 (白起始/黑起始) 再逐行切片複製, 避免逐字節 Python 迴圈。"""
     sq = 40
-    buf = bytearray(WIDTH * HEIGHT * 2)
-    for y in range(HEIGHT):
-        row_off = y * WIDTH * 2
-        row_block = y // sq
+    rowbytes = WIDTH * 2
+
+    def _make_row(start_white):
+        r = bytearray(rowbytes)
         for bx in range(0, WIDTH, sq):
-            is_w = ((bx // sq) + row_block) % 2 == 0
+            is_w = ((bx // sq) % 2 == 0) == start_white
             hi, lo = (0xFF, 0xFF) if is_w else (0x00, 0x00)
-            # ⚠ 邊界: 最後一塊可能不足 sq 像素 (WIDTH 非 sq 倍數時)
-            for px in range(min(sq, WIDTH - bx)):
-                idx = row_off + (bx + px) * 2
-                buf[idx] = hi
-                buf[idx + 1] = lo
+            x0, x1 = bx * 2, min(bx + sq, WIDTH) * 2     # ⚠ 最後一塊可能不足 sq
+            r[x0:x1] = bytes([hi, lo]) * ((x1 - x0) // 2)
+        return bytes(r)
+
+    even_row = _make_row(True)
+    odd_row = _make_row(False)
+    buf = bytearray(WIDTH * HEIGHT * 2)
+    mv = memoryview(buf)
+    for y in range(HEIGHT):
+        mv[y * rowbytes:(y + 1) * rowbytes] = even_row if (y // sq) % 2 == 0 else odd_row
     _lcd.blit(buf)
     time.sleep_ms(1500)
     print("checkerboard done")
@@ -479,14 +483,12 @@ def test_streaming():
     band_h = HEIGHT // 8
     palette = [0xF800, 0x07E0, 0x001F, 0xFFE0, 0x07FF, 0xF81F, 0xFFFF, 0x0000]
     buf = bytearray(WIDTH * HEIGHT * 2)
+    mv = memoryview(buf)
+    rowbytes = WIDTH * 2
     for i, c in enumerate(palette):
         y0, y1 = i * band_h, (i + 1) * band_h if i < 7 else HEIGHT
-        hi, lo = c >> 8, c & 0xFF
-        for y in range(y0, y1):
-            off = y * WIDTH * 2
-            for x in range(0, WIDTH * 2, 2):
-                buf[off + x] = hi
-                buf[off + x + 1] = lo
+        band = bytes([c >> 8, c & 0xFF]) * (WIDTH * (y1 - y0))   # C 速度填整帶
+        mv[y0 * rowbytes:y1 * rowbytes] = band
     _lcd.blit(buf)
     print("  streaming: 8 色水平帶整幀 blit — 請目視乾淨無漸進")
     time.sleep_ms(1500)
@@ -499,21 +501,13 @@ def test_window():
     目視應為乾淨的三區塊, 無漸進/撕裂。"""
     gc.collect()
     buf = bytearray(WIDTH * HEIGHT * 2)
+    mv = memoryview(buf)
+    rowbytes = WIDTH * 2
     half = HEIGHT // 2
-    # 上半紅 (0xF800) / 下半藍 (0x001F)
-    for y in range(HEIGHT):
-        hi, lo = (0x00, 0xF8) if y < half else (0x1F, 0x00)
-        off = y * WIDTH * 2
-        for x in range(0, WIDTH * 2, 2):
-            buf[off + x] = hi
-            buf[off + x + 1] = lo
-    # 中間黃條 (0xFFE0), 跨界處 (half-5 .. half+4) 覆寫
+    mv[0:half * rowbytes] = bytes([0x00, 0xF8]) * (WIDTH * half)              # 上半紅
+    mv[half * rowbytes:HEIGHT * rowbytes] = bytes([0x1F, 0x00]) * (WIDTH * (HEIGHT - half))  # 下半藍
     y0, y1 = half - 5, half + 5
-    for y in range(y0, y1):
-        off = y * WIDTH * 2
-        for x in range(0, WIDTH * 2, 2):
-            buf[off + x] = 0xFF
-            buf[off + x + 1] = 0xE0
+    mv[y0 * rowbytes:y1 * rowbytes] = bytes([0xFF, 0xE0]) * (WIDTH * (y1 - y0))  # 中間黃條
     _lcd.blit(buf)
     print("  window: 上半紅 / 下半藍 / 中間黃條 (整幀 blit) — 請目視確認")
     time.sleep_ms(1500)
