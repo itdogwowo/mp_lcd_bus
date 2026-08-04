@@ -37,6 +37,7 @@ import lcd_bus
 | 方法 | SPI | I2C | I80 | RGB | DSI |
 |---|---|---|---|---|---|
 | `write(buf)` → `trans_id` | ✅ 非同步 | ✅ | ✅ 非同步 | ✅ 非同步 | ✅ 非同步 |
+| `set_window(x0,y0,x1,y1)` | ❌ | ❌ | ❌ | ✅ | ✅ |
 | `write(buf, *, cmd=, addr=, multiline=)` → `None` | ✅ 同步 | ❌ | ❌ | ❌ | ❌ |
 | `readinto(buf, write_val=0)` → `trans_id` | ✅ 非同步 | ✅ | ❌ | ❌ | ❌ |
 | `write_readinto(wbuf, rbuf)` → `trans_id` | ✅ 非同步 | ❌ | ❌ | ❌ | ❌ |
@@ -147,8 +148,14 @@ bus.cmd(0x36, b'\x00')           # MADCTL
 bus.cmd(0x3A, b'\x70')           # COLMOD RGB565
 bus.cmd(0x29)                    # DISPON
 
-tid = bus.write(fb_bytes)        # 非同步複製進 frame buffer
+tid = bus.write(fb_bytes)        # 非同步拷進 frame buffer
 bus.wait(tid)
+
+# 區域寫入: 視窗狀態 (面板 RAMWR 模型) — write(buf) 流式寫入視窗
+bus.set_window(0, 0, WIDTH - 1, HEIGHT // 2 - 1)   # 上半視窗
+tid = bus.write(top_half_bytes)                    # 寫進視窗 (流式, 跨行自動分段)
+bus.wait(tid)
+bus.set_window(0, 0, WIDTH - 1, HEIGHT - 1)        # 恢復全螢幕 (位置同時歸零)
 
 fb = bus.frame_buffer(0)         # 內部 fb 的零拷貝視圖
 memoryview(fb)[:2] = b'\xf8\x00' # 直接寫進 framebuffer
@@ -157,6 +164,12 @@ bus.flush()                      # ⚠ 把髒 L2 cache line 寫回 PSRAM
 bus.set_pattern(1)               # 內建測試圖案（0=無,1=直條,2=橫條,3=BER）
 bus.set_pattern(0)               # 恢復正常顯示
 ```
+
+> **`write(buf)` 統一語義**：所有 bus 的 `write(buf)` 都是「把 buf 寫入目前視窗」。
+> 命令式 bus（SPI/I80）的視窗在面板端（CASET/PASET/RAMWR 命令），記憶體映射
+> bus（RGB/DSI）的視窗是 bus 軟體狀態 — `set_window()` 設定（預設全螢幕），
+> 流式位置從視窗左上角開始、跨行自動分段、超出視窗截斷（與面板 RAMWR 行為一致）。
+> 舊式 `write(buf, x=, y=, w=, h=)` 顯式區域保留向後相容（一次拷貝，不影響視窗狀態）。
 
 ### DSIBus frame buffer 直寫與雙緩衝（ESP32-P4）
 

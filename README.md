@@ -37,6 +37,7 @@ All buses expose the same methods:
 | Method | SPI | I2C | I80 | RGB | DSI |
 |---|---|---|---|---|---|
 | `write(buf)` → `trans_id` | ✅ async | ✅ | ✅ async | ✅ async | ✅ async |
+| `set_window(x0,y0,x1,y1)` | ❌ | ❌ | ❌ | ✅ | ✅ |
 | `write(buf, *, cmd=, addr=, multiline=)` → `None` | ✅ sync | ❌ | ❌ | ❌ | ❌ |
 | `readinto(buf, write_val=0)` → `trans_id` | ✅ async | ✅ | ❌ | ❌ | ❌ |
 | `write_readinto(wbuf, rbuf)` → `trans_id` | ✅ async | ❌ | ❌ | ❌ | ❌ |
@@ -158,6 +159,12 @@ bus.cmd(0x29)                    # DISPON
 tid = bus.write(fb_bytes)        # async copy into frame buffer
 bus.wait(tid)
 
+# 區域寫入: 視窗狀態 (面板 RAMWR 模型) — write(buf) 流式寫入視窗
+bus.set_window(0, 0, WIDTH - 1, HEIGHT // 2 - 1)   # 上半視窗
+tid = bus.write(top_half_bytes)                    # 寫進視窗 (流式, 跨行自動分段)
+bus.wait(tid)
+bus.set_window(0, 0, WIDTH - 1, HEIGHT - 1)        # 恢復全螢幕 (位置同時歸零)
+
 fb = bus.frame_buffer(0)         # zero-copy view of internal fb
 memoryview(fb)[:2] = b'\xf8\x00' # draw directly into the framebuffer
 bus.flush()                      # ⚠ write dirty L2 cache lines back to PSRAM
@@ -165,6 +172,12 @@ bus.flush()                      # ⚠ write dirty L2 cache lines back to PSRAM
 bus.set_pattern(1)               # built-in test pattern (0=none,1=ver bar,2=hor bar,3=BER)
 bus.set_pattern(0)               # back to normal
 ```
+
+> **`write(buf)` 統一語義**：所有 bus 的 `write(buf)` 都是「把 buf 寫入目前視窗」。
+> 命令式 bus（SPI/I80）的視窗在面板端（CASET/PASET/RAMWR 命令），記憶體映射
+> bus（RGB/DSI）的視窗是 bus 軟體狀態 — `set_window()` 設定（預設全螢幕），
+> 流式位置從視窗左上角開始、跨行自動分段、超出視窗截斷（與面板 RAMWR 行為一致）。
+> 舊式 `write(buf, x=, y=, w=, h=)` 顯式區域保留向後相容（一次拷貝，不影響視窗狀態）。
 
 ### DSIBus frame buffer writes & double buffering (ESP32-P4)
 

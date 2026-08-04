@@ -23,10 +23,17 @@ static bool on_color_trans_done(esp_lcd_panel_handle_t panel,
     mp_lcd_dsi_bus_obj_t *self = (mp_lcd_dsi_bus_obj_t *)ctx;
     for (int i = 0; i < self->queue_depth; i++) {
         if (self->ref_bufs[i] != mp_const_none && !self->done_flags[i]) {
-            self->done_flags[i] = true;
-            self->ref_bufs[i] = mp_const_none;
-            self->queue_head = (self->queue_head + 1) % self->queue_depth;
-            self->queue_count--;
+            // 流式 write 會拆成多段 DMA2D 拷貝 — 每段完成遞減一次,
+            // 最後一段完成才算該 write 完成 (queue 槽釋放)
+            if (self->pending_segments[i] > 0) {
+                self->pending_segments[i]--;
+                if (self->pending_segments[i] == 0) {
+                    self->done_flags[i] = true;
+                    self->ref_bufs[i] = mp_const_none;
+                    self->queue_head = (self->queue_head + 1) % self->queue_depth;
+                    self->queue_count--;
+                }
+            }
             break;
         }
     }
@@ -201,7 +208,13 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
 
     memset(self->ref_bufs, 0, sizeof(self->ref_bufs));
     memset(self->done_flags, 0, sizeof(self->done_flags));
+    memset(self->pending_segments, 0, sizeof(self->pending_segments));
     self->queue_head = self->queue_tail = self->queue_count = 0;
+    // 視窗預設全螢幕, 流式位置從 (0,0) 開始
+    self->win_x0 = self->win_y0 = 0;
+    self->win_x1 = self->panel_w - 1;
+    self->win_y1 = self->panel_h - 1;
+    self->pos_x = self->pos_y = 0;
     self->initialized = true;
 
     s_last_dsi = self;
@@ -233,10 +246,12 @@ static mp_obj_t dsi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     static const mp_arg_t allowed[] = {
         { MP_QSTR_self, MP_ARG_OBJ | MP_ARG_REQUIRED },
         { MP_QSTR_buf,  MP_ARG_OBJ | MP_ARG_REQUIRED },
-        { MP_QSTR_x,    MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
-        { MP_QSTR_y,    MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
-        { MP_QSTR_w,    MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
-        { MP_QSTR_h,    MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
+        // 統一 API: x/y/w/h 是舊式顯式區域 (保留向後相容)。
+        // 新用法: set_window() 設定視窗後 write(buf) 流式寫入。
+        { MP_QSTR_x,    MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
+        { MP_QSTR_y,    MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
+        { MP_QSTR_w,    MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
+        { MP_QSTR_h,    MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
@@ -256,24 +271,169 @@ static mp_obj_t dsi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     self->ref_bufs[idx] = args[ARG_buf].u_obj;
     self->done_flags[idx] = false;
 
-    int x = args[ARG_x].u_int;
-    int y = args[ARG_y].u_int;
-    int w = args[ARG_w].u_int ? args[ARG_w].u_int : self->panel_w;
-    int h = args[ARG_h].u_int ? args[ARG_h].u_int : self->panel_h;
+    bool explicit_region = (args[ARG_x].u_int != -1 || args[ARG_y].u_int != -1 ||
+                            args[ARG_w].u_int != -1 || args[ARG_h].u_int != -1);
 
-    // draw_bitmap copies into the internal frame buffer (synchronously),
-    // on_color_trans_done is fired once the copy finishes.
-    esp_err_t ret = esp_lcd_panel_draw_bitmap(self->dpi_panel, x, y, x + w, y + h, bufinfo.buf);
-    if (ret != ESP_OK) {
-        self->ref_bufs[idx] = mp_const_none;
-        mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("draw_bitmap failed err=0x%x"), ret);
+    int bpp = self->bits_per_pixel / 8;    // bytes per pixel
+    size_t px_total = bufinfo.len / (size_t)bpp;   // 可寫像素數 (尾巴忽略)
+
+    // 段表: 流式 write 可能跨行, 每段 = 一行內的矩形 DMA2D 拷貝。
+    // 段數上限 = 視窗行數 (每段至少 1 像素/行) — 動態算, 用大一點的靜態陣列。
+    #define DSI_MAX_SEGS 600
+    int seg_x[DSI_MAX_SEGS], seg_y[DSI_MAX_SEGS], seg_w[DSI_MAX_SEGS], seg_h[DSI_MAX_SEGS];
+    int nsegs = 0;
+
+    if (explicit_region) {
+        // ── 舊式顯式區域: 一次拷貝, 不影響視窗/位置狀態 ──
+        int x = args[ARG_x].u_int;
+        int y = args[ARG_y].u_int;
+        int w = args[ARG_w].u_int;
+        int h = args[ARG_h].u_int;
+        if (x == -1) x = 0;
+        if (y == -1) y = 0;
+        if (w == -1 || w == 0) w = self->panel_w - x;
+        if (h == -1 || h == 0) h = self->panel_h - y;
+        // clip 到面板範圍
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+        if (x + w > self->panel_w) w = self->panel_w - x;
+        if (y + h > self->panel_h) h = self->panel_h - y;
+        if (w > 0 && h > 0 && px_total > 0) {
+            seg_x[0] = x; seg_y[0] = y;
+            seg_w[0] = w; seg_h[0] = h;
+            nsegs = 1;
+        }
+    } else {
+        // ── 流式模式: 從視窗內 pos 開始寫, 逐段前進 (面板 RAMWR 模型) ──
+        size_t px_left = px_total;
+        int px = self->pos_x;
+        int py = self->pos_y;
+        while (px_left > 0) {
+            if (py > self->win_y1) {
+                // 寫滿視窗 → 自動 wrap 回視窗起點 (連續整幀/分批輸入天然成立)
+                px = self->win_x0;
+                py = self->win_y0;
+            } (面板同款行為)
+            int row_left = self->win_x1 - px + 1;  // 本行剩餘像素
+            if (row_left <= 0) {                   // 行尾換行
+                px = self->win_x0;
+                py++;
+                continue;
+            }
+            size_t n_px = px_left;
+            if (n_px > (size_t)row_left) n_px = row_left;
+            if (nsegs < DSI_MAX_SEGS) {
+                seg_x[nsegs] = px;
+                seg_y[nsegs] = py;
+                seg_w[nsegs] = (int)n_px;
+                seg_h[nsegs] = 1;
+                nsegs++;
+            } else {
+                break;   // 段表滿 (理論上不會: 每段至少 1 像素/行)
+            }
+            px += (int)n_px;
+            px_left -= n_px;
+            if (px > self->win_x1) {
+                px = self->win_x0;
+                py++;
+            }
+        }
+        // 更新流式位置 (只算已排程的段)
+        if (nsegs > 0) {
+            self->pos_x = seg_x[nsegs - 1] + seg_w[nsegs - 1];
+            self->pos_y = seg_y[nsegs - 1];
+            if (self->pos_x > self->win_x1) {
+                self->pos_x = self->win_x0;
+                self->pos_y++;
+            }
+        }
     }
 
+    if (nsegs == 0) {
+        // 空寫入 (0 像素) — 直接完成
+        self->ref_bufs[idx] = mp_const_none;
+        self->done_flags[idx] = true;
+        self->queue_tail = (self->queue_tail + 1) % self->queue_depth;
+        self->queue_count++;
+        return mp_obj_new_int(idx + 1);
+    }
+
+    self->pending_segments[idx] = nsegs;
     self->queue_tail = (self->queue_tail + 1) % self->queue_depth;
     self->queue_count++;
+
+    // 逐段 DMA2D 拷貝。DSI driver 一次只允許一個 in-flight 拷貝
+    // (draw_sem), 所以中間段要等上一段完成才發下一段;
+    // 最後一段非同步 (回呼會清 queue 槽)。
+    const uint8_t *src = (const uint8_t *)bufinfo.buf;
+    size_t src_off = 0;
+    for (int k = 0; k < nsegs; k++) {
+        size_t seg_bytes = (size_t)seg_w[k] * seg_h[k] * (size_t)bpp;
+        esp_err_t ret = esp_lcd_panel_draw_bitmap(
+            self->dpi_panel, seg_x[k], seg_y[k],
+            seg_x[k] + seg_w[k], seg_y[k] + seg_h[k],
+            src + src_off);
+        if (ret != ESP_OK) {
+            // 失敗: 釋放 queue 槽 (清除剩餘段計數)
+            self->pending_segments[idx] = 0;
+            self->done_flags[idx] = true;
+            self->ref_bufs[idx] = mp_const_none;
+            self->queue_head = (self->queue_head + 1) % self->queue_depth;
+            self->queue_count--;
+            mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("draw_bitmap failed err=0x%x"), ret);
+        }
+        src_off += seg_bytes;
+        if (k < nsegs - 1) {
+            // 等本段完成 (回呼遞減 pending_segments) 才能發下一段
+            int expect = nsegs - (k + 1);
+            while (self->pending_segments[idx] > expect) {
+                mp_hal_delay_ms(1);
+            }
+        }
+    }
     return mp_obj_new_int(idx + 1);
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(dsi_write_obj, 2, dsi_write);
+
+
+static mp_obj_t dsi_set_window(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_self, ARG_x0, ARG_y0, ARG_x1, ARG_y1 };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_self, MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_x0,   MP_ARG_INT | MP_ARG_REQUIRED },
+        { MP_QSTR_y0,   MP_ARG_INT | MP_ARG_REQUIRED },
+        { MP_QSTR_x1,   MP_ARG_INT | MP_ARG_REQUIRED },
+        { MP_QSTR_y1,   MP_ARG_INT | MP_ARG_REQUIRED },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
+
+    mp_lcd_dsi_bus_obj_t *self = (mp_lcd_dsi_bus_obj_t *)args[ARG_self].u_obj;
+    if (self->dpi_panel == NULL) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("bus deinitialized"));
+    }
+    int x0 = args[ARG_x0].u_int;
+    int y0 = args[ARG_y0].u_int;
+    int x1 = args[ARG_x1].u_int;
+    int y1 = args[ARG_y1].u_int;
+    // clip 到面板範圍
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 >= self->panel_w) x1 = self->panel_w - 1;
+    if (y1 >= self->panel_h) y1 = self->panel_h - 1;
+    if (x1 < x0 || y1 < y0)
+        mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("invalid window"));
+
+    // 視窗語義 = 面板 CASET/PASET: 設定後 write() 從視窗左上角流式寫入
+    self->win_x0 = x0;
+    self->win_y0 = y0;
+    self->win_x1 = x1;
+    self->win_y1 = y1;
+    self->pos_x = x0;
+    self->pos_y = y0;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(dsi_set_window_obj, 1, dsi_set_window);
 
 
 static mp_obj_t dsi_cmd(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
@@ -452,6 +612,7 @@ static mp_obj_t dsi_wait_all(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
         for (int i = 0; i < self->queue_depth; i++) {
             self->ref_bufs[i] = mp_const_none;
             self->done_flags[i] = true;
+            self->pending_segments[i] = 0;
         }
         self->queue_head = self->queue_tail = self->queue_count = 0;
         gc_collect();
@@ -469,6 +630,7 @@ static mp_obj_t dsi_deinit(mp_obj_t self_in) {
     for (int i = 0; i < self->queue_depth; i++) {
         self->ref_bufs[i] = mp_const_none;
         self->done_flags[i] = true;
+        self->pending_segments[i] = 0;
     }
     self->queue_count = 0;
     return mp_const_none;
@@ -478,6 +640,7 @@ static MP_DEFINE_CONST_FUN_OBJ_1(dsi_deinit_obj, dsi_deinit);
 
 static const mp_rom_map_elem_t dsi_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_write),        MP_ROM_PTR(&dsi_write_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_window),   MP_ROM_PTR(&dsi_set_window_obj) },
     { MP_ROM_QSTR(MP_QSTR_cmd),          MP_ROM_PTR(&dsi_cmd_obj) },
     { MP_ROM_QSTR(MP_QSTR_is_busy),      MP_ROM_PTR(&dsi_is_busy_obj) },
     { MP_ROM_QSTR(MP_QSTR_pending),      MP_ROM_PTR(&dsi_pending_obj) },

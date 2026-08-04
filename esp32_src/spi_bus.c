@@ -124,7 +124,7 @@ static void spi_deinit_hardware(mp_lcd_spi_bus_obj_t *self) {
 }
 
 static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
-    enum { ARG_data, ARG_clk, ARG_freq, ARG_host, ARG_sck, ARG_mosi, ARG_miso, ARG_queue_depth };
+    enum { ARG_data, ARG_clk, ARG_freq, ARG_host, ARG_sck, ARG_mosi, ARG_miso, ARG_queue_depth, ARG_dc };
     static const mp_arg_t allowed[] = {
         { MP_QSTR_data, MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
         { MP_QSTR_clk,  MP_ARG_INT, {.u_int = -1} },
@@ -134,6 +134,7 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         { MP_QSTR_mosi, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
         { MP_QSTR_miso, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
         { MP_QSTR_queue_depth, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = SPI_DEFAULT_QUEUE_DEPTH} },
+        { MP_QSTR_dc,   MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed), allowed, args);
@@ -190,6 +191,17 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     self->freq    = args[ARG_freq].u_int;
     self->host    = host;
     self->queue_depth = qdepth;
+    self->dc_pin  = args[ARG_dc].u_int;
+
+    // dc >= 0 時由 bus 管理: 設為輸出, 預設資料狀態 (high)
+    if (self->dc_pin >= 0) {
+        gpio_config_t gc = {
+            .mode = GPIO_MODE_OUTPUT,
+            .pin_bit_mask = 1ULL << self->dc_pin,
+        };
+        gpio_config(&gc);
+        gpio_set_level(self->dc_pin, 1);
+    }
 
     int miso_pin = -1;
     if (use_data_style) {
@@ -273,13 +285,19 @@ static mp_obj_t spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
 
 
 static mp_obj_t spi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
-    enum { ARG_self, ARG_buf, ARG_cmd, ARG_addr, ARG_multiline };
+    enum { ARG_self, ARG_buf, ARG_cmd, ARG_addr, ARG_multiline, ARG_x, ARG_y, ARG_w, ARG_h };
     static const mp_arg_t allowed[] = {
         { MP_QSTR_self,      MP_ARG_OBJ | MP_ARG_REQUIRED },
         { MP_QSTR_buf,       MP_ARG_OBJ | MP_ARG_REQUIRED },
         { MP_QSTR_cmd,       MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
         { MP_QSTR_addr,      MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
         { MP_QSTR_multiline, MP_ARG_BOOL | MP_ARG_KW_ONLY, {.u_bool = true} },
+        // 統一 API 的區域參數 — 命令式 bus (SPI/I80) 忽略,
+        // 位置由 cmd(0x2A/0x2B) 視窗命令控制; 記憶體映射 bus (RGB/DSI) 使用
+        { MP_QSTR_x,         MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
+        { MP_QSTR_y,         MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
+        { MP_QSTR_w,         MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
+        { MP_QSTR_h,         MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 0} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
@@ -321,6 +339,11 @@ static mp_obj_t spi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     bool single = (bufinfo.len <= SPI_MAX_CHUNK && buf_is_internal(bufinfo.buf));
     if (single && self->queue_count >= self->queue_depth)
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
+
+    // dc 由 bus 管理時: 資料 phase 拉高 (命令 phase 由 cmd() 拉低)
+    if (self->dc_pin >= 0) {
+        gpio_set_level(self->dc_pin, 1);
+    }
 
     if (single) {
         int tid = enqueue(self, args[ARG_buf].u_obj, NULL);

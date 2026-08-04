@@ -21,6 +21,7 @@ typedef struct _mp_lcd_spi_bus_obj_t {
     int lane_count;
     int data_pins[8];
     int clk_pin;
+    int dc_pin;      // 選用: >=0 時 bus 管理 dc (cmd()/write() 自動切換), -1 = 外部管理
     int freq;
     int host;
 

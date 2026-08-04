@@ -27,8 +27,13 @@ typedef struct _mp_lcd_dsi_bus_obj_t {
 
     mp_obj_t ref_bufs[DSI_MAX_QUEUE_DEPTH];
     bool done_flags[DSI_MAX_QUEUE_DEPTH];
+    int pending_segments[DSI_MAX_QUEUE_DEPTH];  // 每槽剩餘 DMA 段數 (流式 write 分段)
     int queue_head, queue_tail, queue_count;
     int queue_depth;
+
+    // 視窗狀態 — set_window() 設定, write(buf) 流式寫入 (面板 RAMWR 模型)
+    int win_x0, win_y0, win_x1, win_y1;
+    int pos_x, pos_y;    // 流式寫入位置 (像素, 窗內)
 
     int lane_count;
     int panel_w, panel_h;
