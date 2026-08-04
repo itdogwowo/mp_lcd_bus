@@ -313,7 +313,7 @@ static mp_obj_t dsi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
                 // 寫滿視窗 → 自動 wrap 回視窗起點 (連續整幀/分批輸入天然成立)
                 px = self->win_x0;
                 py = self->win_y0;
-            } (面板同款行為)
+            }
             int row_left = self->win_x1 - px + 1;  // 本行剩餘像素
             if (row_left <= 0) {                   // 行尾換行
                 px = self->win_x0;
