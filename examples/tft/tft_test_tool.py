@@ -289,11 +289,13 @@ def checkerboard():
     row_buf = bytearray(WIDTH * sq * 2)
     for row_y in range(0, HEIGHT, sq):
         for py in range(sq):
+            off = py * WIDTH * 2
             for bx in range(0, WIDTH, sq):
                 is_w = ((bx // sq) + (row_y // sq)) % 2 == 0
                 c = 0xFFFF if is_w else 0x0000
-                for px in range(sq):
-                    idx = ((py * WIDTH) + bx + px) * 2
+                # ⚠ 邊界: 最後一塊可能不足 sq 像素 (WIDTH 非 sq 倍數時)
+                for px in range(min(sq, WIDTH - bx)):
+                    idx = off + (bx + px) * 2
                     row_buf[idx] = c >> 8
                     row_buf[idx + 1] = c & 0xFF
         _lcd.set_window(0, row_y, WIDTH - 1, row_y + sq - 1)
@@ -476,12 +478,67 @@ def flush_bench():
     print("  空 flush ×50 = {}ms → {:.3f} ms/次".format(d, d / 50))
 
 
+def test_streaming():
+    """隱性視窗測試 — 不呼叫 set_window, 連續分批寫入。
+
+    預設視窗 = 全螢幕: write(buf) 流式自動接續 (位置按 buffer 長度前進),
+    寫滿視窗自動 wrap 回起點 → 連續分批/整幀輸入不需要 set_window。
+    這裡 8 批不同色連續寫, 若顯示為 8 條水平色帶 = 隱性視窗正確。"""
+    gc.collect()
+    total = WIDTH * HEIGHT * 2
+    batch = total // 8
+    colors = [0xF800, 0x07E0, 0x001F, 0xFFE0, 0x07FF, 0xF81F, 0xFFFF, 0x0000]
+    for c in colors:
+        buf = bytearray(batch)
+        for j in range(0, batch, 2):
+            buf[j] = c >> 8
+            buf[j + 1] = c & 0xFF
+        # ⚠ 沒有 set_window — 位置自動接續
+        hn = _lcd._bus.write_data_async(buf)
+        if hn is not None:
+            _lcd._bus.wait(hn)
+    _lcd._bus.flush()
+    print("  streaming: 8 批 × {}B 連續寫入 (無 set_window) — 請目視應為 8 色水平帶".format(batch))
+    time.sleep_ms(1500)
+
+
+def test_window():
+    """顯式 set_window 測試 — 區域獨立更新。
+
+    set_window(x0,y0,x1,y1) 設區域 + 重置流式位置:
+    上半紅 → 下半藍 → 中間黃條, 各自獨立更新互不影響。"""
+    gc.collect()
+    _clear()
+
+    half_px = WIDTH * (HEIGHT // 2)
+    top = bytearray(b'\x00\xf8' * half_px)      # 紅
+    _lcd.set_window(0, 0, WIDTH - 1, HEIGHT // 2 - 1)
+    hn = _lcd._bus.write_data_async(top)
+    if hn is not None:
+        _lcd._bus.wait(hn)
+
+    bot = bytearray(b'\x1f\x00' * half_px)      # 藍
+    _lcd.set_window(0, HEIGHT // 2, WIDTH - 1, HEIGHT - 1)
+    hn = _lcd._bus.write_data_async(bot)
+    if hn is not None:
+        _lcd._bus.wait(hn)
+
+    bar = bytearray(b'\xe0\xff' * (WIDTH * 10))  # 中間黃條 (10 行)
+    _lcd.set_window(0, HEIGHT // 2 - 5, WIDTH - 1, HEIGHT // 2 + 4)
+    hn = _lcd._bus.write_data_async(bar)
+    if hn is not None:
+        _lcd._bus.wait(hn)
+    _lcd._bus.flush()
+    print("  window: 上半紅 / 下半藍 / 中間黃條 — 請目視確認")
+    time.sleep_ms(1500)
+
+
 # ══════════════════════════════════════════════════════════════
 #  entry
 # ══════════════════════════════════════════════════════════════
 
 def run_all():
-    """依序: FPS 三種路徑 → flush 代價 → 目視測試"""
+    """依序: FPS 三種路徑 → flush 代價 → 視窗測試 → 目視測試"""
     init_tft()
     try:
         fps_test(50)
@@ -491,6 +548,10 @@ def run_all():
         fps_test_present(50)
         _clear(); time.sleep_ms(300)
         flush_bench()
+        _clear(); time.sleep_ms(300)
+        test_streaming()
+        _clear(); time.sleep_ms(300)
+        test_window()
         _clear(); time.sleep_ms(300)
         fill_colors()
         _clear(); time.sleep_ms(300)

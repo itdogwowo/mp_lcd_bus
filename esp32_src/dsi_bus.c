@@ -305,9 +305,13 @@ static mp_obj_t dsi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
         }
     } else {
         // ── 流式模式: 從視窗內 pos 開始寫, 逐段前進 (面板 RAMWR 模型) ──
+        // 分段策略: 行首對齊且剩餘 ≥ 一整行 → 合併成矩形 (全螢幕 = 1 段,
+        // 一次 DMA2D); 行中開始 → 寫到行尾 (1 行)。避免逐行分段拖垮吞吐。
         size_t px_left = px_total;
         int px = self->pos_x;
         int py = self->pos_y;
+        int region_w = self->win_x1 - self->win_x0 + 1;
+        int region_h = self->win_y1 - self->win_y0 + 1;
         while (px_left > 0) {
             if (py > self->win_y1) {
                 // 寫滿視窗 → 自動 wrap 回視窗起點 (連續整幀/分批輸入天然成立)
@@ -320,13 +324,26 @@ static mp_obj_t dsi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
                 py++;
                 continue;
             }
-            size_t n_px = px_left;
-            if (n_px > (size_t)row_left) n_px = row_left;
+            size_t n_px;
+            int seg_h_ = 1;
+            if (px == self->win_x0 && px_left >= (size_t)region_w) {
+                // 行首 → 合併完整行成矩形 (不超過視窗底部)
+                size_t n_rows = px_left / (size_t)region_w;
+                int rows_avail = region_h - (py - self->win_y0);
+                if ((size_t)rows_avail < n_rows) n_rows = rows_avail;
+                if (n_rows == 0) n_rows = 1;       // 至少一行
+                n_px = n_rows * (size_t)region_w;
+                seg_h_ = (int)n_rows;
+            } else {
+                // 行中開始 (或剩餘不足一行) → 寫到行尾
+                n_px = px_left;
+                if (n_px > (size_t)row_left) n_px = row_left;
+            }
             if (nsegs < DSI_MAX_SEGS) {
                 seg_x[nsegs] = px;
                 seg_y[nsegs] = py;
                 seg_w[nsegs] = (int)n_px;
-                seg_h[nsegs] = 1;
+                seg_h[nsegs] = seg_h_;
                 nsegs++;
             } else {
                 break;   // 段表滿 (理論上不會: 每段至少 1 像素/行)

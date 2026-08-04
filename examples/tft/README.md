@@ -69,6 +69,8 @@ tft_test_tool.run_all()          # 依 ⚙ 設定區自動初始化 → FPS×3 �
 | `fps_test_tft` | TFT.show_frame 層（library 開銷） |
 | `fps_test_present` | begin_display + present 管線 |
 | `flush_bench` | flush/wait_all 代價 |
+| `test_streaming` | **隱性視窗** — 不 set_window 連續分批寫入（自動接續 + wrap） |
+| `test_window` | **顯式 set_window** — 區域獨立更新（上半/下半/中條） |
 | `fill_colors` / `color_bars` / `gradient` / `checkerboard` / `shapes` / `animate` | 目視驗證 |
 
 ### DSI 性能預期（JC1060P470 + JD9165 1024x600）
