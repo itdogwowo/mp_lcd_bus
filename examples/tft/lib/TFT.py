@@ -177,6 +177,14 @@ class TFT:
         self.set_window(x, y, x + w - 1, y + h - 1)
         self._bus.write_data_async(data)
         self._bus.flush()
+
+    def blit(self, data, w=None, h=None):
+        """整頁原子更新 (零撕裂)。DSI = page-flip 雙緩衝; 其他 bus = RAMWR 整幀。
+        adapter 自動依能力分流, 呼叫端介面一致。"""
+        if w is None: w = self.width
+        if h is None: h = self.height
+        self._bus.show_atomic(data, w, h)
+
     def show_frame(self, data):
         """Send pixel data (window must be set already)"""
         self._bus.write_frame(data)

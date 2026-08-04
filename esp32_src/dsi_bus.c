@@ -18,11 +18,14 @@
 
 static mp_lcd_dsi_bus_obj_t *s_last_dsi = NULL;
 
-static bool on_color_trans_done(esp_lcd_panel_handle_t panel,
+static bool IRAM_ATTR on_color_trans_done(esp_lcd_panel_handle_t panel,
                                 esp_lcd_dpi_panel_event_data_t *edata, void *ctx) {
     mp_lcd_dsi_bus_obj_t *self = (mp_lcd_dsi_bus_obj_t *)ctx;
     for (int i = 0; i < self->queue_depth; i++) {
         if (self->ref_bufs[i] != mp_const_none && !self->done_flags[i]) {
+            // present() 槽 (slot_kind==1) 等的是幀邊界 (on_refresh_done),
+            // 不由 DMA 段計數釋放 — 跳過, 別誤遞減。
+            if (self->slot_kind[i] == 1) break;
             // 流式 write 會拆成多段 DMA2D 拷貝 — 每段完成遞減一次,
             // 最後一段完成才算該 write 完成 (queue 槽釋放)
             if (self->pending_segments[i] > 0) {
@@ -35,6 +38,27 @@ static bool on_color_trans_done(esp_lcd_panel_handle_t panel,
                 }
             }
             break;
+        }
+    }
+    return false;
+}
+
+// 幀邊界 (VSYNC) callback — present() 提交 page-flip 後,
+// 在此處確認「上一幀掃完、新 fb 已生效」, 該槽才算完成。
+// 只釋放 head 上的 present 槽 (slot_kind==1); DMA 槽不在此處理。
+static bool IRAM_ATTR on_refresh_done(esp_lcd_panel_handle_t panel,
+                                      esp_lcd_dpi_panel_event_data_t *edata, void *ctx) {
+    mp_lcd_dsi_bus_obj_t *self = (mp_lcd_dsi_bus_obj_t *)ctx;
+    for (int i = 0; i < self->queue_depth; i++) {
+        if (self->ref_bufs[i] != mp_const_none && !self->done_flags[i]) {
+            // 只有 present 槽認幀邊界為完成 (一次 refresh = 完成)
+            if (self->slot_kind[i] == 1) {
+                self->done_flags[i] = true;
+                self->ref_bufs[i] = mp_const_none;
+                self->queue_head = (self->queue_head + 1) % self->queue_depth;
+                self->queue_count--;
+            }
+            break;   // FIFO head 假設不變 (present 與 DMA 槽都按序排隊)
         }
     }
     return false;
@@ -182,7 +206,10 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     self->fbs[1] = fb1;
     self->fbs[2] = fb2;
 
-    esp_lcd_dpi_panel_event_callbacks_t cbs = { .on_color_trans_done = on_color_trans_done };
+    esp_lcd_dpi_panel_event_callbacks_t cbs = {
+        .on_color_trans_done = on_color_trans_done,
+        .on_refresh_done     = on_refresh_done,
+    };
     ret = esp_lcd_dpi_panel_register_event_callbacks(self->dpi_panel, &cbs, self);
     if (ret != ESP_OK) goto err_panel;
 
@@ -209,7 +236,9 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     memset(self->ref_bufs, 0, sizeof(self->ref_bufs));
     memset(self->done_flags, 0, sizeof(self->done_flags));
     memset(self->pending_segments, 0, sizeof(self->pending_segments));
+    memset(self->slot_kind, 0, sizeof(self->slot_kind));
     self->queue_head = self->queue_tail = self->queue_count = 0;
+    self->cur_fb = 0;       // fb0 為初始顯示中; back_buffer()/present() 用 1-cur_fb 選離屏
     // 視窗預設全螢幕, 流式位置從 (0,0) 開始
     self->win_x0 = self->win_y0 = 0;
     self->win_x1 = self->panel_w - 1;
@@ -630,6 +659,7 @@ static mp_obj_t dsi_wait_all(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
             self->ref_bufs[i] = mp_const_none;
             self->done_flags[i] = true;
             self->pending_segments[i] = 0;
+            self->slot_kind[i] = 0;
         }
         self->queue_head = self->queue_tail = self->queue_count = 0;
         gc_collect();
@@ -637,6 +667,74 @@ static mp_obj_t dsi_wait_all(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(dsi_wait_all_obj, 1, dsi_wait_all);
+
+
+// back_buffer() — 回傳目前「離屏」framebuffer 的零拷貝 view。
+// C 內部依 cur_fb 決定離屏 (1-cur_fb), 上層不需知道哪塊在顯示、也不傳 index。
+// 用法: bus.back_buffer()[:] = data  (或 framebuf 直接以它為 backing)。
+static mp_obj_t dsi_back_buffer(mp_obj_t self_in) {
+    mp_lcd_dsi_bus_obj_t *self = (mp_lcd_dsi_bus_obj_t *)self_in;
+    if (self->num_fbs < 2 || self->fbs[0] == NULL || self->fbs[1] == NULL)
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("page-flip needs fb_count>=2"));
+    int back = 1 - self->cur_fb;
+    return mp_obj_new_bytearray_by_ref(self->fb_size, self->fbs[back]);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(dsi_back_buffer_obj, dsi_back_buffer);
+
+
+// present([timeout_ms]) — 整頁原子更新: 把 back_buffer() 指向的離屏 fb 提交為
+// 顯示目標, 在幀邊界 (VSYNC) 原子切換 (IDF 的 page-flip 優化: draw_bitmap 來源是
+// 內部 fb → 只 cache writeback + 切 cur_fb_index, 不拷貝)。
+//
+// 流程全在 C 內部 (老奉收這裡): 選離屏 → draw_bitmap 觸發切換 → 入 queue 槽
+// (slot_kind=1, 等幀邊界) → 回 tid。Python 端用既有 wait(tid)/wait_all() 等完成,
+// 與 write() 完全同款契約, 零新 wait API。
+static mp_obj_t dsi_present(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_self, ARG_timeout_ms };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_self,       MP_ARG_OBJ | MP_ARG_REQUIRED },
+        { MP_QSTR_timeout_ms, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
+
+    mp_lcd_dsi_bus_obj_t *self = (mp_lcd_dsi_bus_obj_t *)args[ARG_self].u_obj;
+    if (self->dpi_panel == NULL)
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("bus deinitialized"));
+    if (self->num_fbs < 2 || self->fbs[0] == NULL || self->fbs[1] == NULL)
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("page-flip needs fb_count>=2"));
+    if (self->queue_count >= self->queue_depth)
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
+
+    int idx = self->queue_tail;
+    int back = 1 - self->cur_fb;
+    // 入隊: 此槽無外部 buf (純 fb 指標操作), 用 non-None ref 佔位標記「在途」
+    self->ref_bufs[idx] = MP_OBJ_FROM_PTR(self);   // 非 none 即可; GC 不影響 (內部 fb 不靠此釘住)
+    self->done_flags[idx] = false;
+    self->slot_kind[idx] = 1;          // 等幀邊界 (on_refresh_done)
+    self->pending_segments[idx] = 0;   // 不走 DMA 段計數
+
+    // IDF 範圍檢查命中內部 fb → 只 cache writeback + 幀邊界切 cur_fb_index (不拷貝)
+    esp_err_t ret = esp_lcd_panel_draw_bitmap(
+        self->dpi_panel, 0, 0, self->panel_w, self->panel_h, self->fbs[back]);
+    if (ret != ESP_OK) {
+        // 失敗: 釋放槽位, 別卡住 queue
+        self->ref_bufs[idx] = mp_const_none;
+        self->done_flags[idx] = true;
+        self->slot_kind[idx] = 0;
+        mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("present (draw_bitmap) failed err=0x%x"), ret);
+    }
+    self->cur_fb = back;               // 離屏現在是顯示目標
+    self->queue_tail = (self->queue_tail + 1) % self->queue_depth;
+    self->queue_count++;
+
+    // 0 幀等待: 若上層要非同步 (直接拿 tid), 不在此阻塞。這裡只回 tid,
+    // 等/不等由上層決定 (wait(tid) 或繼續)。timeout_ms 參數保留給未來「同步等到完成」
+    // 的便利形式 — 目前非同步 (與 write() 一致, 回 tid)。
+    (void)args[ARG_timeout_ms].u_int;
+    return mp_obj_new_int(idx + 1);    // tid — 與 write() 同契約
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(dsi_present_obj, 1, dsi_present);
 
 
 static mp_obj_t dsi_deinit(mp_obj_t self_in) {
@@ -648,6 +746,7 @@ static mp_obj_t dsi_deinit(mp_obj_t self_in) {
         self->ref_bufs[i] = mp_const_none;
         self->done_flags[i] = true;
         self->pending_segments[i] = 0;
+        self->slot_kind[i] = 0;
     }
     self->queue_count = 0;
     return mp_const_none;
@@ -665,6 +764,8 @@ static const mp_rom_map_elem_t dsi_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_wait_all),     MP_ROM_PTR(&dsi_wait_all_obj) },
     { MP_ROM_QSTR(MP_QSTR_lane_count),   MP_ROM_PTR(&dsi_lane_count_obj) },
     { MP_ROM_QSTR(MP_QSTR_frame_buffer), MP_ROM_PTR(&dsi_frame_buffer_obj) },
+    { MP_ROM_QSTR(MP_QSTR_back_buffer),  MP_ROM_PTR(&dsi_back_buffer_obj) },
+    { MP_ROM_QSTR(MP_QSTR_present),      MP_ROM_PTR(&dsi_present_obj) },
     { MP_ROM_QSTR(MP_QSTR_flush),        MP_ROM_PTR(&dsi_flush_obj) },
     { MP_ROM_QSTR(MP_QSTR_set_pattern),  MP_ROM_PTR(&dsi_set_pattern_obj) },
     { MP_ROM_QSTR(MP_QSTR_deinit),       MP_ROM_PTR(&dsi_deinit_obj) },

@@ -187,28 +187,18 @@ def _hsv(h, s=100, v=100):
     return ((int(r * 31) & 0x1F) << 11) | ((int(g * 63) & 0x3F) << 5) | (int(b * 31) & 0x1F)
 
 
-def _write_solid(color565):
-    """全螢幕填色 — 走統一介面 (set_window + 流式 write_data_async)"""
-    chunk = bytearray(8192)
-    for i in range(4096):
-        chunk[i * 2] = color565 >> 8
-        chunk[i * 2 + 1] = color565 & 0xFF
-    total = WIDTH * HEIGHT
-    mv = memoryview(chunk)
-    _lcd.set_window(0, 0, WIDTH - 1, HEIGHT - 1)
-    written = 0
-    while written < total:
-        n = min(total - written, 4096)
-        hn = _lcd._bus.write_data_async(mv[:n * 2])
-        if hn is not None:
-            _lcd._bus.wait(hn)
-        written += n
-    _lcd._bus.flush()
+def _fill_solid(color565):
+    """全螢幕填色 — 組整幀 → blit (整頁原子更新, 零撕裂)"""
+    buf = bytearray(WIDTH * HEIGHT * 2)
+    hi, lo = color565 >> 8, color565 & 0xFF
+    for i in range(0, len(buf), 2):
+        buf[i] = hi
+        buf[i + 1] = lo
+    _lcd.blit(buf)
 
 
 def _clear():
-    _lcd.set_window(0, 0, WIDTH - 1, HEIGHT - 1)
-    _write_solid(0x0000)
+    _fill_solid(0x0000)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -225,38 +215,31 @@ def fill_colors():
     ]
     for name, c in colors:
         print("  %s (0x%04X) ..." % (name, c))
-        _write_solid(c)
+        _fill_solid(c)
         time.sleep_ms(400)
     print("fill_colors done")
 
 
 def color_bars():
-    """八色垂直條"""
+    """八色水平帶 — 組整幀 → blit (整頁原子)"""
     bar_h = HEIGHT // 8
-    for i, c in enumerate([0xF800, 0x07E0, 0x001F, 0xFFFF,
-                           0xFFE0, 0x07FF, 0xF81F, 0x0000]):
-        y0, y1 = i * bar_h, (i + 1) * bar_h - 1 if i < 7 else HEIGHT - 1
-        pixels = WIDTH * (y1 - y0 + 1)
-        chunk = bytearray(4096 * 2)
-        for j in range(4096):
-            chunk[j * 2] = c >> 8
-            chunk[j * 2 + 1] = c & 0xFF
-        mv = memoryview(chunk)
-        _lcd.set_window(0, y0, WIDTH - 1, y1)
-        remaining = pixels
-        while remaining > 0:
-            n = min(remaining, 4096)
-            hn = _lcd._bus.write_data_async(mv[:n * 2])
-            if hn is not None:
-                _lcd._bus.wait(hn)
-            remaining -= n
-        _lcd._bus.flush()
+    palette = [0xF800, 0x07E0, 0x001F, 0xFFFF, 0xFFE0, 0x07FF, 0xF81F, 0x0000]
+    buf = bytearray(WIDTH * HEIGHT * 2)
+    for i, c in enumerate(palette):
+        y0, y1 = i * bar_h, (i + 1) * bar_h if i < 7 else HEIGHT
+        hi, lo = c >> 8, c & 0xFF
+        for y in range(y0, y1):
+            off = y * WIDTH * 2
+            for x in range(0, WIDTH * 2, 2):
+                buf[off + x] = hi
+                buf[off + x + 1] = lo
+    _lcd.blit(buf)
     time.sleep_ms(1200)
     print("color_bars done")
 
 
 def gradient():
-    """RGB 水平漸變"""
+    """RGB 水平漸變 — 組整幀 → blit (整頁原子)"""
     gc.collect()
     row = bytearray(WIDTH * 2)
     for x in range(WIDTH):
@@ -267,60 +250,50 @@ def gradient():
         row[x * 2] = c >> 8
         row[x * 2 + 1] = c & 0xFF
 
-    BATCH = 40
-    for y in range(0, HEIGHT, BATCH):
-        h = min(BATCH, HEIGHT - y)
-        buf = bytearray(WIDTH * h * 2)
-        for i in range(h):
-            off = i * WIDTH * 2
-            buf[off:off + len(row)] = row
-        _lcd.set_window(0, y, WIDTH - 1, y + h - 1)
-        hn = _lcd._bus.write_data_async(buf)
-        if hn is not None:
-            _lcd._bus.wait(hn)
-        _lcd._bus.flush()
+    buf = bytearray(WIDTH * HEIGHT * 2)
+    for y in range(HEIGHT):
+        off = y * WIDTH * 2
+        buf[off:off + len(row)] = row
+    _lcd.blit(buf)
     time.sleep_ms(1500)
     print("gradient done")
 
 
 def checkerboard():
-    """棋盤格 (40x40)"""
+    """棋盤格 (40x40) — 組整幀 → blit (整頁原子)"""
     sq = 40
-    row_buf = bytearray(WIDTH * sq * 2)
-    for row_y in range(0, HEIGHT, sq):
-        for py in range(sq):
-            off = py * WIDTH * 2
-            for bx in range(0, WIDTH, sq):
-                is_w = ((bx // sq) + (row_y // sq)) % 2 == 0
-                c = 0xFFFF if is_w else 0x0000
-                # ⚠ 邊界: 最後一塊可能不足 sq 像素 (WIDTH 非 sq 倍數時)
-                for px in range(min(sq, WIDTH - bx)):
-                    idx = off + (bx + px) * 2
-                    row_buf[idx] = c >> 8
-                    row_buf[idx + 1] = c & 0xFF
-        _lcd.set_window(0, row_y, WIDTH - 1, row_y + sq - 1)
-        hn = _lcd._bus.write_data_async(row_buf)
-        if hn is not None:
-            _lcd._bus.wait(hn)
-        _lcd._bus.flush()
+    buf = bytearray(WIDTH * HEIGHT * 2)
+    for y in range(HEIGHT):
+        row_off = y * WIDTH * 2
+        row_block = y // sq
+        for bx in range(0, WIDTH, sq):
+            is_w = ((bx // sq) + row_block) % 2 == 0
+            hi, lo = (0xFF, 0xFF) if is_w else (0x00, 0x00)
+            # ⚠ 邊界: 最後一塊可能不足 sq 像素 (WIDTH 非 sq 倍數時)
+            for px in range(min(sq, WIDTH - bx)):
+                idx = row_off + (bx + px) * 2
+                buf[idx] = hi
+                buf[idx + 1] = lo
+    _lcd.blit(buf)
     time.sleep_ms(1500)
     print("checkerboard done")
 
 
 def shapes():
-    """同心圓 + 放射線 (framebuf)"""
+    """同心圓 + 放射線 (framebuf) — 整幀 blit, 圖形垂直置中"""
     import framebuf
-    h_buf = min(HEIGHT, 400)
-    buf = bytearray(WIDTH * h_buf * 2)
-    fbuf = framebuf.FrameBuffer(buf, WIDTH, h_buf, framebuf.RGB565)
+    h_draw = min(HEIGHT, 400)
+    yoff = (HEIGHT - h_draw) // 2          # 圖形在整幀中的垂直偏移 (置中)
+    buf = bytearray(WIDTH * HEIGHT * 2)
+    fbuf = framebuf.FrameBuffer(buf, WIDTH, HEIGHT, framebuf.RGB565)
 
     def _pixel(x, y, c):
-        if 0 <= x < WIDTH and 0 <= y < h_buf:
-            fbuf.pixel(x, y, c)
+        if 0 <= x < WIDTH and 0 <= y < h_draw:
+            fbuf.pixel(x, y + yoff, c)
 
     fbuf.fill(0)
-    cx, cy = WIDTH // 2, h_buf // 2
-    for r in range(20, min(WIDTH, h_buf) // 2 - 10, 15):
+    cx, cy = WIDTH // 2, h_draw // 2
+    for r in range(20, min(WIDTH, h_draw) // 2 - 10, 15):
         c = _color(255, 255 - r, r)
         x, y, err = r, 0, 0
         while x >= y:
@@ -329,13 +302,13 @@ def shapes():
             y += 1; err += 1 + 2 * y
             if 2 * (err - x) + 1 > 0:
                 x -= 1; err += 1 - 2 * x
-    _lcd.show(buf, 0, (HEIGHT - h_buf) // 2, WIDTH, h_buf)
+    _lcd.blit(buf)
     time.sleep_ms(1500)
 
     fbuf.fill(0)
     for _ in range(40):
         a = random.uniform(0, 2 * math.pi)
-        rl = random.randint(30, min(WIDTH, h_buf) // 2 - 10)
+        rl = random.randint(30, min(WIDTH, h_draw) // 2 - 10)
         ex = int(cx + math.cos(a) * rl)
         ey = int(cy + math.sin(a) * rl)
         c = _color(random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
@@ -353,7 +326,7 @@ def shapes():
                 err += dy; x0 += sx
             if e2 <= dx:
                 err += dx; y0 += sy
-    _lcd.show(buf, 0, (HEIGHT - h_buf) // 2, WIDTH, h_buf)
+    _lcd.blit(buf)
     time.sleep_ms(1500)
     _clear()
     print("shapes done")
@@ -377,7 +350,7 @@ def animate():
         if by <= 0 or by >= HEIGHT - 1:
             bdy = -bdy
         fbuf.ellipse(bx, by, 15, 15, _color(255, 255, 0), True)
-        _lcd.show(buf)
+        _lcd.blit(buf)
         time.sleep_ms(8)
 
     print("animate: starfield")
@@ -390,7 +363,7 @@ def animate():
             sx = (sx + spd) % WIDTH
             stars[i] = (sx, sy, spd)
             fbuf.pixel(sx, sy, _color(spd * 80, spd * 80, spd * 80 + 60))
-        _lcd.show(buf)
+        _lcd.blit(buf)
         time.sleep_ms(15)
     _clear()
     print("animate done")
@@ -455,6 +428,25 @@ def fps_test_present(frames=50):
         fps, elapsed / frames * 1000, mbps))
 
 
+def fps_test_blit(frames=50):
+    """整頁原子 (blit/page-flip) FPS — memcpy 離屏 + 幀邊界切換。
+
+    DSI: back_buffer() memcpy 1.2MB (~5ms) + present() 等幀邊界 (~15ms@65Hz)
+    → 受這兩者限制 (零撕裂代價)。SPI/其他: RAMWR 整幀, 無 page-flip。"""
+    gc.collect()
+    total = WIDTH * HEIGHT * 2
+    full_w = memoryview(bytearray(b'\xff\xff' * (total // 2))[:total])
+    full_b = memoryview(bytearray(total))
+    t0 = time.ticks_us()
+    for n in range(frames):
+        _lcd.blit(full_w if n & 1 else full_b)
+    elapsed = time.ticks_diff(time.ticks_us(), t0) / 1_000_000
+    fps = frames / elapsed
+    mbps = total * frames / elapsed / (1024 * 1024)
+    print("FPS(blit): {:.0f}  ({:.1f} ms/frame, {:.1f} MB/s)".format(
+        fps, elapsed / frames * 1000, mbps))
+
+
 def flush_bench():
     """flush()/wait_all() 代價實測"""
     gc.collect()
@@ -479,57 +471,51 @@ def flush_bench():
 
 
 def test_streaming():
-    """隱性視窗測試 — 不呼叫 set_window, 連續分批寫入。
+    """整頁更新測試 — 8 色水平帶 (整幀組好 → blit)。
 
-    預設視窗 = 全螢幕: write(buf) 流式自動接續 (位置按 buffer 長度前進),
-    寫滿視窗自動 wrap 回起點 → 連續分批/整幀輸入不需要 set_window。
-    這裡 8 批不同色連續寫, 若顯示為 8 條水平色帶 = 隱性視窗正確。"""
+    原流式 (連續分批無 set_window) 語義已由 adapter 整幀化吸收;
+    此處組 8 色水平帶整幀 → blit, 目視應為乾淨 8 條色帶, 無漸進/撕裂。"""
     gc.collect()
-    total = WIDTH * HEIGHT * 2
-    batch = total // 8
-    colors = [0xF800, 0x07E0, 0x001F, 0xFFE0, 0x07FF, 0xF81F, 0xFFFF, 0x0000]
-    for c in colors:
-        buf = bytearray(batch)
-        for j in range(0, batch, 2):
-            buf[j] = c >> 8
-            buf[j + 1] = c & 0xFF
-        # ⚠ 沒有 set_window — 位置自動接續
-        hn = _lcd._bus.write_data_async(buf)
-        if hn is not None:
-            _lcd._bus.wait(hn)
-    _lcd._bus.flush()
-    print("  streaming: 8 批 × {}B 連續寫入 (無 set_window) — 請目視應為 8 色水平帶".format(batch))
+    band_h = HEIGHT // 8
+    palette = [0xF800, 0x07E0, 0x001F, 0xFFE0, 0x07FF, 0xF81F, 0xFFFF, 0x0000]
+    buf = bytearray(WIDTH * HEIGHT * 2)
+    for i, c in enumerate(palette):
+        y0, y1 = i * band_h, (i + 1) * band_h if i < 7 else HEIGHT
+        hi, lo = c >> 8, c & 0xFF
+        for y in range(y0, y1):
+            off = y * WIDTH * 2
+            for x in range(0, WIDTH * 2, 2):
+                buf[off + x] = hi
+                buf[off + x + 1] = lo
+    _lcd.blit(buf)
+    print("  streaming: 8 色水平帶整幀 blit — 請目視乾淨無漸進")
     time.sleep_ms(1500)
 
 
 def test_window():
-    """顯式 set_window 測試 — 區域獨立更新。
+    """整頁更新測試 — 上半紅 / 下半藍 / 中間黃條 (整幀組好 → blit)。
 
-    set_window(x0,y0,x1,y1) 設區域 + 重置流式位置:
-    上半紅 → 下半藍 → 中間黃條, 各自獨立更新互不影響。"""
+    原 set_window 區域獨立更新語義已由整幀化吸收; 此處組整幀 → blit,
+    目視應為乾淨的三區塊, 無漸進/撕裂。"""
     gc.collect()
-    _clear()
-
-    half_px = WIDTH * (HEIGHT // 2)
-    top = bytearray(b'\x00\xf8' * half_px)      # 紅
-    _lcd.set_window(0, 0, WIDTH - 1, HEIGHT // 2 - 1)
-    hn = _lcd._bus.write_data_async(top)
-    if hn is not None:
-        _lcd._bus.wait(hn)
-
-    bot = bytearray(b'\x1f\x00' * half_px)      # 藍
-    _lcd.set_window(0, HEIGHT // 2, WIDTH - 1, HEIGHT - 1)
-    hn = _lcd._bus.write_data_async(bot)
-    if hn is not None:
-        _lcd._bus.wait(hn)
-
-    bar = bytearray(b'\xe0\xff' * (WIDTH * 10))  # 中間黃條 (10 行)
-    _lcd.set_window(0, HEIGHT // 2 - 5, WIDTH - 1, HEIGHT // 2 + 4)
-    hn = _lcd._bus.write_data_async(bar)
-    if hn is not None:
-        _lcd._bus.wait(hn)
-    _lcd._bus.flush()
-    print("  window: 上半紅 / 下半藍 / 中間黃條 — 請目視確認")
+    buf = bytearray(WIDTH * HEIGHT * 2)
+    half = HEIGHT // 2
+    # 上半紅 (0xF800) / 下半藍 (0x001F)
+    for y in range(HEIGHT):
+        hi, lo = (0x00, 0xF8) if y < half else (0x1F, 0x00)
+        off = y * WIDTH * 2
+        for x in range(0, WIDTH * 2, 2):
+            buf[off + x] = hi
+            buf[off + x + 1] = lo
+    # 中間黃條 (0xFFE0), 跨界處 (half-5 .. half+4) 覆寫
+    y0, y1 = half - 5, half + 5
+    for y in range(y0, y1):
+        off = y * WIDTH * 2
+        for x in range(0, WIDTH * 2, 2):
+            buf[off + x] = 0xFF
+            buf[off + x + 1] = 0xE0
+    _lcd.blit(buf)
+    print("  window: 上半紅 / 下半藍 / 中間黃條 (整幀 blit) — 請目視確認")
     time.sleep_ms(1500)
 
 
@@ -538,7 +524,7 @@ def test_window():
 # ══════════════════════════════════════════════════════════════
 
 def run_all():
-    """依序: FPS 三種路徑 → flush 代價 → 視窗測試 → 目視測試"""
+    """依序: FPS 各路徑 → flush 代價 → 視窗測試 → 目視測試"""
     init_tft()
     try:
         fps_test(50)
@@ -546,6 +532,8 @@ def run_all():
         fps_test_tft(50)
         _clear(); time.sleep_ms(300)
         fps_test_present(50)
+        _clear(); time.sleep_ms(300)
+        fps_test_blit(50)
         _clear(); time.sleep_ms(300)
         flush_bench()
         _clear(); time.sleep_ms(300)

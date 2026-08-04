@@ -29,6 +29,17 @@ class BusAdapter:
     def wait(self, handle):
         pass
 
+    def show_atomic(self, data, w, h):
+        """整頁原子更新 (零撕裂的統一高階介面)。
+
+        命令式 bus (SPI/I80/I2C/RGB): 設全螢幕視窗 + RAMWR 推整幀 (面板 GRAM
+        更新原子, 本來就不撕裂)。
+        DSI/RGB-PSRAM: 由子類覆寫成 page-flip (離屏 fb 寫完整幀 → 幀邊界原子切換)。
+        預設實作 = 命令式退化路徑。"""
+        self.set_window(0, 0, w - 1, h - 1)
+        self.write_data_async(data)
+        self.flush()
+
 
 class SpiBusAdapter(BusAdapter):
     def __init__(self, spi, dc=None, cs=None, rst=None, bounce_size=32768):
@@ -620,6 +631,8 @@ class DsiBusAdapter(BusAdapter):
         self._w = width
         self._h = height
         self._dma = hasattr(bus, 'wait') and hasattr(bus, 'pending')
+        # page-flip 能力: C 層需暴露 back_buffer() + present() (fb_count>=2)
+        self._pflip = hasattr(bus, 'back_buffer') and hasattr(bus, 'present')
 
     def write_cmd(self, cmd):
         # video mode 無視窗/RAMWR 命令 → 忽略 (保留 set_window/present 語義)
@@ -652,6 +665,18 @@ class DsiBusAdapter(BusAdapter):
 
     def set_window(self, x0, y0, x1, y1):
         self._bus.set_window(x0, y0, x1, y1)
+
+    def show_atomic(self, data, w, h):
+        """整頁零撕裂更新 — page-flip (DSI 雙緩衝)。
+
+        back_buffer() 拿 C 選的離屏 fb view → memcpy 整幀進去 → present() 在幀邊界
+        原子切換掃描目標 → wait(tid) 等切換生效。零 cur_fb/index/flip-then-wait 拼裝。"""
+        if not self._pflip:
+            return super().show_atomic(data, w, h)   # 退化 (命令式)
+        self._bus.back_buffer()[:] = data            # 寫進 C 選的離屏 fb
+        tid = self._bus.present()                    # C: 選離屏+flip+入隊, 回 tid
+        if self._dma and tid is not None:
+            self._bus.wait(tid)                      # 既有 wait — 等幀邊界 (與 write 同款)
 
     def write_frame(self, data):
         """整幀阻塞傳輸"""

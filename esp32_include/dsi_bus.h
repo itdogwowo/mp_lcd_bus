@@ -28,6 +28,7 @@ typedef struct _mp_lcd_dsi_bus_obj_t {
     mp_obj_t ref_bufs[DSI_MAX_QUEUE_DEPTH];
     bool done_flags[DSI_MAX_QUEUE_DEPTH];
     int pending_segments[DSI_MAX_QUEUE_DEPTH];  // 每槽剩餘 DMA 段數 (流式 write 分段)
+    uint8_t slot_kind[DSI_MAX_QUEUE_DEPTH];     // 每槽完成來源: 0=DMA2D段(on_color_trans_done), 1=幀邊界(on_refresh_done, present)
     int queue_head, queue_tail, queue_count;
     int queue_depth;
 
@@ -42,6 +43,7 @@ typedef struct _mp_lcd_dsi_bus_obj_t {
     int num_fbs;
     size_t fb_size;
     void *fbs[DSI_MAX_FBS];
+    int cur_fb;                     // 目前顯示中 fb index (0/1) — present() 內部維護
 
     bool initialized;
 } mp_lcd_dsi_bus_obj_t;
