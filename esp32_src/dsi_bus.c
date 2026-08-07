@@ -7,6 +7,7 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_heap_caps.h"
 #include "esp_cache.h"
+#include "esp_memory_utils.h"
 
 #include "py/runtime.h"
 #include "py/objarray.h"
@@ -15,6 +16,31 @@
 #include "driver/gpio.h"
 
 #include <string.h>
+
+// ── 本地工具：判斷指針是否落在 IDF 可做 esp_cache_msync 的 PSRAM cacheable 區 ──
+// esp_cache_msync 僅接受 PSRAM cacheable 位址 (外部 RAM、非 DMA、非 IRAM/DRAM)。
+// 傳入內部 DRAM / PSRAM DMA pool / 對齊後指針越界都會回 ESP_ERR_INVALID_ARG (103)。
+static inline bool _dsi_is_psram_cacheable(const void *p) {
+    if (p == NULL) return false;
+    // esp_ptr_external_ram() = 是否在 PSRAM 虛擬位址區間 (cacheable 映射)
+    if (!esp_ptr_external_ram(p)) return false;
+    // heap_caps_get_allocated_ptr 驗證真的從 heap 配置而來 (避免 frame buffer 特殊區段)
+    return heap_caps_get_allocated_size((void *)p) > 0 || true;
+    // 最後一個 || true：內部 fb (由 esp_lcd driver 配置、不透過 heap_caps) 也應為 cacheable PSRAM。
+    // esp_ptr_external_ram() 已是充分條件，因此保留 true。
+}
+
+// 確保 self->bounce_buf 至少有 need 位元組；回傳 true=配置成功。
+// 失敗時不改變原有 buffer (避免洩漏)。
+static bool _dsi_ensure_bounce(mp_lcd_dsi_bus_obj_t *self, size_t need) {
+    if (self->bounce_buf != NULL && self->bounce_size >= need) return true;
+    uint8_t *nb = (uint8_t *)heap_caps_malloc(need, MALLOC_CAP_SPIRAM);
+    if (nb == NULL) return false;
+    if (self->bounce_buf != NULL) heap_caps_free(self->bounce_buf);
+    self->bounce_buf  = nb;
+    self->bounce_size = need;
+    return true;
+}
 
 static mp_lcd_dsi_bus_obj_t *s_last_dsi = NULL;
 
@@ -76,6 +102,12 @@ static void dsi_deinit_hardware(mp_lcd_dsi_bus_obj_t *self) {
             .pin_bit_mask = 1ULL << self->reset_pin,
         };
         gpio_config(&gc);
+    }
+    // 釋放 PSRAM bounce buffer
+    if (self->bounce_buf != NULL) {
+        heap_caps_free(self->bounce_buf);
+        self->bounce_buf = NULL;
+        self->bounce_size = 0;
     }
     self->dpi_panel = NULL;
     self->dbi_io = NULL;
@@ -240,6 +272,8 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     memset(self->slot_kind, 0, sizeof(self->slot_kind));
     self->queue_head = self->queue_tail = self->queue_count = 0;
     self->cur_fb = 0;       // fb0 為初始顯示中; back_buffer()/present() 用 1-cur_fb 選離屏
+    self->bounce_buf = NULL;   // bounce buffer 懶分配：首次 dsi_write 遇到非 PSRAM src 才配置
+    self->bounce_size = 0;
     // 視窗預設全螢幕, 流式位置從 (0,0) 開始
     self->win_x0 = self->win_y0 = 0;
     self->win_x1 = self->panel_w - 1;
@@ -415,14 +449,30 @@ static mp_obj_t dsi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     // 逐段 DMA2D 拷貝。DSI driver 一次只允許一個 in-flight 拷貝
     // (draw_sem), 所以中間段要等上一段完成才發下一段;
     // 最後一段非同步 (回呼會清 queue 槽)。
+    //
+    // ⚠ IDF esp_lcd_panel_draw_bitmap() 內部會對 src 指針調用 esp_cache_msync()。
+    // 若 src 不在 PSRAM cacheable 區 (例如 MicroPython 預設 bytearray 配在 DRAM),
+    // msync 回 ESP_ERR_INVALID_ARG (103) 並大量 ERROR 刷屏。
+    // 修復：若 src 非 PSRAM cacheable, 先 memcpy 到本物件的 PSRAM bounce buffer,
+    //       再把 bounce 位址傳給 draw_bitmap。bounce 緩衝按最大段需求成長。
     const uint8_t *src = (const uint8_t *)bufinfo.buf;
+    const bool src_in_psram = _dsi_is_psram_cacheable(src);
     size_t src_off = 0;
     for (int k = 0; k < nsegs; k++) {
         size_t seg_bytes = (size_t)seg_w[k] * seg_h[k] * (size_t)bpp;
+        const void *draw_src = src + src_off;
+        if (!src_in_psram && seg_bytes > 0) {
+            // bounce 到 PSRAM 再 draw；確保 bounce >= seg_bytes
+            if (_dsi_ensure_bounce(self, seg_bytes)) {
+                memcpy(self->bounce_buf, src + src_off, seg_bytes);
+                draw_src = self->bounce_buf;
+            }
+            // 若 bounce 配置失敗: 回退原 src, IDF 只會印 ERROR 不影響功能
+        }
         esp_err_t ret = esp_lcd_panel_draw_bitmap(
             self->dpi_panel, seg_x[k], seg_y[k],
             seg_x[k] + seg_w[k], seg_y[k] + seg_h[k],
-            src + src_off);
+            draw_src);
         if (ret != ESP_OK) {
             // 失敗: 釋放 queue 槽 (清除剩餘段計數)
             self->pending_segments[idx] = 0;
@@ -586,9 +636,25 @@ static mp_obj_t dsi_flush(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     // 之後若不 esp_cache_msync() 把髒行寫回，DMA 會一直讀到舊內容 —
     // 症狀就是「殘留/黑帶/閃爍」。flush() 就是把指定區域的髒 cache line
     // 寫回 PSRAM（DIR_C2M），與 esp_lcd DPI driver 內部做法相同。
-    uint8_t *start = (uint8_t *)self->fbs[idx] + (y * self->panel_w + x) * self->bits_per_pixel / 8;
-    size_t size = (size_t)h * self->panel_w * self->bits_per_pixel / 8;
-    esp_cache_msync(start, size, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    //
+    // ⚠ size 必須是矩形 (x..x+w, y..y+h) 佔用的位元組，不能用 panel_w * h：
+    // 否則 x>0 / w<panel_w 時 start+size 會越過本 fb 範圍，esp_cache_msync
+    // 回 ESP_ERR_INVALID_ARG (103)，也就是用戶看到的 invalid addr 錯誤。
+    int bpp_bytes = self->bits_per_pixel / 8;
+    uint8_t *fb_base = (uint8_t *)self->fbs[idx];
+    // 按 cache line 把 size 擴到「所有受影響的行」— cache 是以 cache-line
+    // 為單位回寫，行內局部寫入也需要該行完整的 cache 線被寫回。
+    // 為安全起見：從 (y 行起始) 到 (y+h-1 行結束) 的整行區間做 msync，
+    // 因為 start 可能不對齊，UNALIGNED flag 已處理頭尾不對齊；
+    // 但 size 只覆蓋 w*h*bpp 也正確 (UNALIGNED 會把頭尾對齊到 cache line)。
+    size_t size = (size_t)w * h * bpp_bytes;
+    uint8_t *start = fb_base + ((size_t)y * self->panel_w + x) * bpp_bytes;
+    // ⚠ 邊界防衛：start+size 不超過本 fb 尾端（避免 esp_cache_msync invalid addr）
+    size_t max_size = fb_base + self->fb_size - start;
+    if (size > max_size) size = max_size;
+    if (start >= fb_base && start < fb_base + self->fb_size && size > 0) {
+        esp_cache_msync(start, size, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    }
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(dsi_flush_obj, 1, dsi_flush);
@@ -724,6 +790,16 @@ static mp_obj_t dsi_present(size_t n_args, const mp_obj_t *pos_args, mp_map_t *k
     self->cur_fb = back;               // 離屏現在是顯示目標
     self->queue_tail = (self->queue_tail + 1) % self->queue_depth;
     self->queue_count++;
+
+    // ⚠ 先顯式 msync 離屏 fb：Python 端 back_buffer()[:] = data 是 CPU 直接
+    // 寫 PSRAM，經 write-back L2 cache。DPI DMA 讀 PSRAM **bypass cache**，
+    // 不把髒行寫回 DMA 就會看到舊內容 (殘留/黑帶/閃爍)。
+    // IDF 的 draw_bitmap page-flip fast path (src == 內部 fb) 不一定會做
+    // 全範圍 C2M，因此主動做一次，與 dsi_flush() 同義。
+    if (self->fbs[back] != NULL && self->fb_size > 0) {
+        esp_cache_msync(self->fbs[back], self->fb_size,
+                        ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    }
 
     // IDF 範圍檢查命中內部 fb → 只 cache writeback + 幀邊界切 cur_fb_index (不拷貝)
     esp_err_t ret = esp_lcd_panel_draw_bitmap(

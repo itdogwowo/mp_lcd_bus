@@ -45,6 +45,13 @@ typedef struct _mp_lcd_dsi_bus_obj_t {
     void *fbs[DSI_MAX_FBS];
     int cur_fb;                     // 目前顯示中 fb index (0/1) — present() 內部維護
 
+    // PSRAM bounce buffer：當 dsi_write 傳入的 src 不在 PSRAM cacheable 區時，
+    // IDF draw_bitmap 內部 esp_cache_msync 會報 ESP_ERR_INVALID_ARG (103)。
+    // 先 memcpy 到這個 PSRAM buffer 再 draw_bitmap，避免無效 msync 刷屏。
+    // 懶分配：首次需要時才 heap_caps_malloc(MALLOC_CAP_SPIRAM)。
+    uint8_t *bounce_buf;
+    size_t    bounce_size;
+
     bool initialized;
 } mp_lcd_dsi_bus_obj_t;
 
