@@ -12,6 +12,7 @@ extern const mp_obj_type_t mp_lcd_dsi_bus_type;
 #if SOC_MIPI_DSI_SUPPORTED
 
 #include "esp_lcd_mipi_dsi.h"
+#include "driver/ppa.h"
 
 // 佇列槽上限（陣列大小），實際深度由建構子 queue_depth 決定（1..此值）
 #define DSI_MAX_QUEUE_DEPTH    8
@@ -45,12 +46,13 @@ typedef struct _mp_lcd_dsi_bus_obj_t {
     void *fbs[DSI_MAX_FBS];
     int cur_fb;                     // 目前顯示中 fb index (0/1) — present() 內部維護
 
-    // PSRAM bounce buffer：當 dsi_write 傳入的 src 不在 PSRAM cacheable 區時，
-    // IDF draw_bitmap 內部 esp_cache_msync 會報 ESP_ERR_INVALID_ARG (103)。
-    // 先 memcpy 到這個 PSRAM buffer 再 draw_bitmap，避免無效 msync 刷屏。
-    // 懶分配：首次需要時才 heap_caps_malloc(MALLOC_CAP_SPIRAM)。
+    // PPA (P4 的 DMA2D) — write() 硬體 2D blit: src → 後台 fb，CPU 全程不碰像素
+    ppa_client_handle_t ppa_client;
+    // PSRAM bounce buffer：src 在內部 DRAM 時，PPA 內部的 esp_cache_msync 對
+    // DRAM 位址會回 ESP_ERR_INVALID_ARG 並刷屏 ERROR → 先整段 memcpy 到這裡。
+    // src 在 PSRAM 時完全不使用（零拷貝直接進 PPA）。懶分配，deinit 時釋放。
     uint8_t *bounce_buf;
-    size_t    bounce_size;
+    size_t   bounce_size;
 
     bool initialized;
 } mp_lcd_dsi_bus_obj_t;

@@ -609,22 +609,21 @@ class RgbBusAdapter(BusAdapter):
 
 
 class DsiBusAdapter(BusAdapter):
-    """MIPI DSI (DPI video mode) — 像素由 frame buffer 串流,
-    write() = DMA2D 把外部 buffer 拷進「顯示中」的 fb (LVGL 同款路徑)。
+    """MIPI DSI (DPI video mode) — P4 + DSI + fb_count>=2 雙緩衝預設模型。
 
-    命令語義規劃 (對齊 SPI adapter 的 cmd 規劃):
-      * write_cmd / write_cmd_data → DBI 命令通道 (bus.cmd)，供 init sequence
-                                     (JD9165 的 page 切換 / SLPOUT / DISPON) 使用
-      * CASET(0x2A) / PASET(0x2B) / RAMWR(0x2C) → 忽略: DSI video mode 沒有
-        視窗/RAMWR 命令, 視窗語義由 C 層 set_window() 軟體維持
-      * set_window(x0,y0,x1,y1)    → 直映 C bus.set_window (軟體視窗 + 流式位置)
-      * write_data_async(data)     → bus.write(data): 流式語義在 C 層
-                                    (視窗內位置追蹤 + 跨行自動分段), 回傳 tid
-      * write_frame_dma(fb)        → [bus.write(fb)] 一次整幀 DMA2D,
-                                    回傳 tids 列表 (對齊 SPI 語義)
+    底層 C 層合約 (簡單 & 零撕裂 & 零複雜決策):
+      * bus.write(buf)      資料搬到後台 frame buffer (離屏 fbs[1-cur_fb])
+                            搬運引擎 = PPA (P4 的 DMA2D 硬體) 2D blit,
+                            CPU 不碰像素 (src 在 DRAM 時自動先 bounce 到 PSRAM)
+                            返回即同步完成 (tid=0, wait(0) 直接通過)
+                            零撕裂 (不寫前台 fb)、零 esp_cache_msync ERROR
+      * bus.present()       下一幀 VSYNC 原子切換 cur_fb，回傳 tid 等幀邊界
+      * set_window(...)     軟體維護視窗 (對齊 SPI/RAMWR 模型)
+      * write_cmd(...)      DBI 命令通道供 JD9165 init sequence 使用
 
-    撕裂: DMA2D 拷進顯示中 fb，拷貝 ~4ms 期間有一條撕裂線掃過 —
-          整幀更新可接受；要零撕裂需 fb_count=2 內部雙緩衝 (見 README)。
+    撕裂: write() 永不寫前台 → 零撕裂；present() 才在 VSYNC 原子切換 → 零撕裂
+          使用者唯一要做的事：「寫完後 call present() 就看到新畫面」
+          fb_count=1 則退化為寫前台 (存在撕裂風險, 不鼓勵但不強制阻擋)
     """
     def __init__(self, bus, width, height):
         self._bus = bus
@@ -646,60 +645,51 @@ class DsiBusAdapter(BusAdapter):
         self._bus.cmd(cmd, param=data if data is not None else b'')
 
     def write_data_async(self, data, chunk=32768):
-        """流式寫入目前視窗 — 位置/分段由 C 層 set_window+write 處理"""
-        if self._dma:
-            for attempt in range(2):
-                try:
-                    return self._bus.write(data)
-                except RuntimeError as e:
-                    try:
-                        self._bus.wait_all()
-                    except Exception:
-                        pass
-                    if attempt == 0:
-                        continue
-                    self._log_err("write_data_async", e)
-                    return None
-        self._bus.write(data)
-        return True
+        """流式寫入目前視窗 — 位置/分段由 C 層 set_window+write 處理。
+        DSI C 層已同步完成 (tid=0)，此函式只是為了對齊其他 adapter 的語義。"""
+        try:
+            tid = self._bus.write(data)
+            # C 層 write 已同步完成 (tid=0)，但仍回傳 non-None 讓上層可選擇要不要 wait
+            return tid
+        except RuntimeError as e:
+            self._log_err("write_data_async", e)
+            return None
 
     def set_window(self, x0, y0, x1, y1):
         self._bus.set_window(x0, y0, x1, y1)
 
     def show_atomic(self, data, w, h):
-        """整頁零撕裂更新 — page-flip (DSI 雙緩衝)。
+        """整頁零撕裂更新 — 後台寫入 + present 切換。
 
-        back_buffer() 拿 C 選的離屏 fb view → memcpy 整幀進去 → present() 在幀邊界
-        原子切換掃描目標 → wait(tid) 等切換生效。零 cur_fb/index/flip-then-wait 拼裝。"""
+        簡單原則：雙緩開啟時，寫後台 → 切前台，別讓使用者選、不用懂 API 歷史包袱。"""
         if not self._pflip:
             return super().show_atomic(data, w, h)   # 退化 (命令式)
         self._bus.back_buffer()[:] = data            # 寫進 C 選的離屏 fb
         tid = self._bus.present()                    # C: 選離屏+flip+入隊, 回 tid
         if self._dma and tid is not None:
-            self._bus.wait(tid)                      # 既有 wait — 等幀邊界 (與 write 同款)
+            self._bus.wait(tid)                      # 等幀邊界 (與 write 同款)
 
     def write_frame(self, data):
-        """整幀阻塞傳輸"""
-        if self._dma:
-            self._bus.write(data)
-            self._bus.wait_all()
-        else:
-            self._bus.write(data)
+        """整幀傳輸 (DSI: 寫後台 + 自動 present，對齊其他 adapter 語義)"""
+        self._bus.write(data)
+        if self._pflip:
+            tid = self._bus.present()
+            if self._dma and tid:
+                self._bus.wait(tid)
 
     def write_frame_dma(self, data, chunk=32768):
-        """DMA 幀傳輸 — 一次整幀 DMA2D (無 32KB 分塊限制)。
-        回傳 tids 列表 (對齊 SPI adapter 語義)。"""
+        """對齊 SPI adapter：回傳 tids 列表 (DSI C 層同步, tid=0 但仍回來)"""
         try:
+            tids = []
             tid = self._bus.write(data)
-            return [tid] if tid is not None else []
+            tids.append(tid)
+            if self._pflip:
+                tid = self._bus.present()
+                tids.append(tid)
+            return tids
         except RuntimeError as e:
-            self._bus.wait_all()
-            try:
-                tid = self._bus.write(data)
-                return [tid] if tid is not None else []
-            except RuntimeError:
-                self._log_err("write_frame_dma", e)
-                return []
+            self._log_err("write_frame_dma", e)
+            return []
 
     @staticmethod
     def _log_err(where, e):

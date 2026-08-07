@@ -17,32 +17,26 @@
 
 #include <string.h>
 
-// ── 本地工具：判斷指針是否落在 IDF 可做 esp_cache_msync 的 PSRAM cacheable 區 ──
-// esp_cache_msync 僅接受 PSRAM cacheable 位址 (外部 RAM、非 DMA、非 IRAM/DRAM)。
-// 傳入內部 DRAM / PSRAM DMA pool / 對齊後指針越界都會回 ESP_ERR_INVALID_ARG (103)。
-static inline bool _dsi_is_psram_cacheable(const void *p) {
-    if (p == NULL) return false;
-    // esp_ptr_external_ram() = 是否在 PSRAM 虛擬位址區間 (cacheable 映射)
-    if (!esp_ptr_external_ram(p)) return false;
-    // heap_caps_get_allocated_ptr 驗證真的從 heap 配置而來 (避免 frame buffer 特殊區段)
-    return heap_caps_get_allocated_size((void *)p) > 0 || true;
-    // 最後一個 || true：內部 fb (由 esp_lcd driver 配置、不透過 heap_caps) 也應為 cacheable PSRAM。
-    // esp_ptr_external_ram() 已是充分條件，因此保留 true。
+static mp_lcd_dsi_bus_obj_t *s_last_dsi = NULL;
+
+// ── PSRAM 判定 + bounce ──────────────────────────────────────────────
+// PPA 內部會對 src 呼叫 esp_cache_msync(C2M)，只接受 PSRAM cacheable
+// 位址；DRAM src 會觸發 ESP_ERR_INVALID_ARG 並刷屏 ERROR。
+// → src 在 DRAM 時先整段 memcpy 到 PSRAM bounce，再交給 PPA。
+// → src 在 PSRAM 時零拷貝直接進 PPA（硬體搬運，CPU 不碰像素）。
+static inline bool _dsi_is_psram(const void *p) {
+    return p != NULL && esp_ptr_external_ram(p);
 }
 
-// 確保 self->bounce_buf 至少有 need 位元組；回傳 true=配置成功。
-// 失敗時不改變原有 buffer (避免洩漏)。
 static bool _dsi_ensure_bounce(mp_lcd_dsi_bus_obj_t *self, size_t need) {
     if (self->bounce_buf != NULL && self->bounce_size >= need) return true;
     uint8_t *nb = (uint8_t *)heap_caps_malloc(need, MALLOC_CAP_SPIRAM);
     if (nb == NULL) return false;
     if (self->bounce_buf != NULL) heap_caps_free(self->bounce_buf);
-    self->bounce_buf  = nb;
+    self->bounce_buf = nb;
     self->bounce_size = need;
     return true;
 }
-
-static mp_lcd_dsi_bus_obj_t *s_last_dsi = NULL;
 
 static bool on_color_trans_done(esp_lcd_panel_handle_t panel,
                                 esp_lcd_dpi_panel_event_data_t *edata, void *ctx) {
@@ -103,7 +97,11 @@ static void dsi_deinit_hardware(mp_lcd_dsi_bus_obj_t *self) {
         };
         gpio_config(&gc);
     }
-    // 釋放 PSRAM bounce buffer
+    // PPA client 釋放 (SRM engine ref count 遞減; 最後一個 client 會關 PPA 時鐘)
+    if (self->ppa_client) {
+        ppa_unregister_client(self->ppa_client);
+        self->ppa_client = NULL;
+    }
     if (self->bounce_buf != NULL) {
         heap_caps_free(self->bounce_buf);
         self->bounce_buf = NULL;
@@ -266,14 +264,27 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     ret = esp_lcd_panel_init(self->dpi_panel);
     if (ret != ESP_OK) goto err_panel;
 
+    // 註冊 PPA SRM client — write() 用它做硬體 2D blit (src → 後台 fb)。
+    // use_dma2d=True (預設) 時才註冊；False 或註冊失敗 → write() 自動退回
+    // CPU memcpy 路徑 (功能不受影響，只是 blit 佔 CPU)。
+    // max_pending_trans_num=1: write() 用 BLOCKING 模式, 一次一筆即可。
+    self->ppa_client = NULL;
+    if (args[ARG_use_dma2d].u_bool) {
+        ppa_client_config_t ppa_cfg = {
+            .oper_type = PPA_OPERATION_SRM,
+            .max_pending_trans_num = 1,
+        };
+        if (ppa_register_client(&ppa_cfg, &self->ppa_client) != ESP_OK) {
+            self->ppa_client = NULL;   // 退回 CPU 路徑
+        }
+    }
+
     memset(self->ref_bufs, 0, sizeof(self->ref_bufs));
     memset(self->done_flags, 0, sizeof(self->done_flags));
     memset(self->pending_segments, 0, sizeof(self->pending_segments));
     memset(self->slot_kind, 0, sizeof(self->slot_kind));
     self->queue_head = self->queue_tail = self->queue_count = 0;
     self->cur_fb = 0;       // fb0 為初始顯示中; back_buffer()/present() 用 1-cur_fb 選離屏
-    self->bounce_buf = NULL;   // bounce buffer 懶分配：首次 dsi_write 遇到非 PSRAM src 才配置
-    self->bounce_size = 0;
     // 視窗預設全螢幕, 流式位置從 (0,0) 開始
     self->win_x0 = self->win_y0 = 0;
     self->win_x1 = self->panel_w - 1;
@@ -328,15 +339,6 @@ static mp_obj_t dsi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     if (self->dpi_panel == NULL) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("bus deinitialized"));
     }
-    if (self->queue_count >= self->queue_depth)
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
-
-    int idx = self->queue_tail;
-    self->ref_bufs[idx] = args[ARG_buf].u_obj;
-    self->done_flags[idx] = false;
-    // ⚠ 必設: 槽位可能剛被 present() 用過 (slot_kind=1) 且 ISR 釋放時不重置。
-    // 不明確標回 DMA(0), on_color_trans_done 會跳過這槽 → 永不釋放 → wait 卡死。
-    self->slot_kind[idx] = 0;
 
     bool explicit_region = (args[ARG_x].u_int != -1 || args[ARG_y].u_int != -1 ||
                             args[ARG_w].u_int != -1 || args[ARG_h].u_int != -1);
@@ -344,8 +346,7 @@ static mp_obj_t dsi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     int bpp = self->bits_per_pixel / 8;    // bytes per pixel
     size_t px_total = bufinfo.len / (size_t)bpp;   // 可寫像素數 (尾巴忽略)
 
-    // 段表: 流式 write 可能跨行, 每段 = 一行內的矩形 DMA2D 拷貝。
-    // 段數上限 = 視窗行數 (每段至少 1 像素/行) — 動態算, 用大一點的靜態陣列。
+    // 段表: 流式 write 可能跨行, 每段 = 一個 2D 矩形 (PPA 硬體 blit / CPU memcpy)。
     #define DSI_MAX_SEGS 600
     int seg_x[DSI_MAX_SEGS], seg_y[DSI_MAX_SEGS], seg_w[DSI_MAX_SEGS], seg_h[DSI_MAX_SEGS];
     int nsegs = 0;
@@ -372,126 +373,161 @@ static mp_obj_t dsi_write(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
         }
     } else {
         // ── 流式模式: 從視窗內 pos 開始寫, 逐段前進 (面板 RAMWR 模型) ──
-        // 分段策略: 行首對齊且剩餘 ≥ 一整行 → 合併成矩形 (全螢幕 = 1 段,
-        // 一次 DMA2D); 行中開始 → 寫到行尾 (1 行)。避免逐行分段拖垮吞吐。
+        // 以「窗內線性偏移」追蹤位置，最簡且正確：
+        //   L = (py-win_y0)*region_w + (px-win_x0)，範圍 [0, region_w*region_h)
+        // 每段產出一個「真正的 2D 矩形」(seg_w × seg_h)：
+        //   • 行首對齊且剩餘 ≥ 一整行 → 合併連續完整行 (w=region_w, h=n_rows)
+        //   • 否則 → 寫到當前行尾 (w=剩餘像素, h=1)
+        // 注意：合併行段的寬必須是 region_w（不是 n_rows*region_w），
+        // 否則 PPA/CPU 2D blit 會把多行誤當超寬單行 → 畫面錯位。
+        size_t region_w = (size_t)(self->win_x1 - self->win_x0 + 1);
+        size_t region_h = (size_t)(self->win_y1 - self->win_y0 + 1);
+        size_t region_px = region_w * region_h;
         size_t px_left = px_total;
-        int px = self->pos_x;
-        int py = self->pos_y;
-        int region_w = self->win_x1 - self->win_x0 + 1;
-        int region_h = self->win_y1 - self->win_y0 + 1;
-        while (px_left > 0) {
-            if (py > self->win_y1) {
-                // 寫滿視窗 → 自動 wrap 回視窗起點 (連續整幀/分批輸入天然成立)
-                px = self->win_x0;
-                py = self->win_y0;
-            }
-            int row_left = self->win_x1 - px + 1;  // 本行剩餘像素
-            if (row_left <= 0) {                   // 行尾換行
-                px = self->win_x0;
-                py++;
-                continue;
-            }
-            size_t n_px;
-            int seg_h_ = 1;
-            if (px == self->win_x0 && px_left >= (size_t)region_w) {
-                // 行首 → 合併完整行成矩形 (不超過視窗底部)
-                size_t n_rows = px_left / (size_t)region_w;
-                int rows_avail = region_h - (py - self->win_y0);
-                if ((size_t)rows_avail < n_rows) n_rows = rows_avail;
-                if (n_rows == 0) n_rows = 1;       // 至少一行
-                n_px = n_rows * (size_t)region_w;
-                seg_h_ = (int)n_rows;
+        // 目前線性位置 (wrap 到窗內)
+        size_t L = (size_t)(self->pos_y - self->win_y0) * region_w
+                 + (size_t)(self->pos_x - self->win_x0);
+        L %= region_px;
+        while (px_left > 0 && nsegs < DSI_MAX_SEGS) {
+            size_t row_off = L % region_w;        // 行內偏移
+            size_t row     = L / region_w;        // 行號 (窗內)
+            size_t seg_w_, seg_h_, n_px;
+            if (row_off == 0 && px_left >= region_w) {
+                // 行首對齊 → 合併連續完整行
+                size_t n_rows = px_left / region_w;
+                size_t rows_left = region_h - row;
+                if (n_rows > rows_left) n_rows = rows_left;
+                seg_w_ = region_w;
+                seg_h_ = n_rows;
+                n_px   = n_rows * region_w;
             } else {
-                // 行中開始 (或剩餘不足一行) → 寫到行尾
-                n_px = px_left;
-                if (n_px > (size_t)row_left) n_px = row_left;
+                // 行中 (或剩餘不足一行) → 寫到當前行尾
+                size_t row_left = region_w - row_off;
+                n_px = px_left < row_left ? px_left : row_left;
+                seg_w_ = n_px;
+                seg_h_ = 1;
             }
-            if (nsegs < DSI_MAX_SEGS) {
-                seg_x[nsegs] = px;
-                seg_y[nsegs] = py;
-                seg_w[nsegs] = (int)n_px;
-                seg_h[nsegs] = seg_h_;
-                nsegs++;
-            } else {
-                break;   // 段表滿 (理論上不會: 每段至少 1 像素/行)
-            }
-            px += (int)n_px;
+            seg_x[nsegs] = self->win_x0 + (int)row_off;
+            seg_y[nsegs] = self->win_y0 + (int)row;
+            seg_w[nsegs] = (int)seg_w_;
+            seg_h[nsegs] = (int)seg_h_;
+            nsegs++;
+            L = (L + n_px) % region_px;   // 前進並 wrap
             px_left -= n_px;
-            if (px > self->win_x1) {
-                px = self->win_x0;
-                py++;
-            }
         }
-        // 更新流式位置 (只算已排程的段)
-        if (nsegs > 0) {
-            self->pos_x = seg_x[nsegs - 1] + seg_w[nsegs - 1];
-            self->pos_y = seg_y[nsegs - 1];
-            if (self->pos_x > self->win_x1) {
-                self->pos_x = self->win_x0;
-                self->pos_y++;
-            }
-        }
+        // 更新流式位置 (線性位置還原成 x/y)
+        self->pos_x = self->win_x0 + (int)(L % region_w);
+        self->pos_y = self->win_y0 + (int)(L / region_w);
     }
 
     if (nsegs == 0) {
-        // 空寫入 (0 像素) — 直接完成
-        self->ref_bufs[idx] = mp_const_none;
-        self->done_flags[idx] = true;
-        self->queue_tail = (self->queue_tail + 1) % self->queue_depth;
-        self->queue_count++;
-        return mp_obj_new_int(idx + 1);
+        return mp_obj_new_int(0);    // 空寫入: 回傳 "0 tid" (同步完成, 不需 wait)
     }
 
-    self->pending_segments[idx] = nsegs;
-    self->queue_tail = (self->queue_tail + 1) % self->queue_depth;
-    self->queue_count++;
-
-    // 逐段 DMA2D 拷貝。DSI driver 一次只允許一個 in-flight 拷貝
-    // (draw_sem), 所以中間段要等上一段完成才發下一段;
-    // 最後一段非同步 (回呼會清 queue 槽)。
+    // ──────────────────────────────────────────────────────────────
+    // 合約 (P4 + DSI + fb_count>=2 雙緩)：
+    //   write(buf) 把像素搬到「後台 frame buffer」，絕不碰前台 → 零撕裂。
+    //   present() 才在 VSYNC 原子切換。
     //
-    // ⚠ IDF esp_lcd_panel_draw_bitmap() 內部會對 src 指針調用 esp_cache_msync()。
-    // 若 src 不在 PSRAM cacheable 區 (例如 MicroPython 預設 bytearray 配在 DRAM),
-    // msync 回 ESP_ERR_INVALID_ARG (103) 並大量 ERROR 刷屏。
-    // 修復：若 src 非 PSRAM cacheable, 先 memcpy 到本物件的 PSRAM bounce buffer,
-    //       再把 bounce 位址傳給 draw_bitmap。bounce 緩衝按最大段需求成長。
+    // 搬運引擎 (依序選擇):
+    //   1. PPA SRM (P4 的 DMA2D 硬體): 2D 硬體 blit, CPU 不碰像素。
+    //      PPA 內部自動處理 cache (src C2M + dst M2C invalidate)。
+    //      ⚠ PPA 的內部 msync 只接受 PSRAM 位址 → src 在 DRAM 時
+    //        先 memcpy 到 PSRAM bounce (一次 CPU 拷貝, 之後仍是硬體搬)。
+    //   2. CPU 逐行 memcpy (無 PPA / PPA 失敗時退回; fb_count==1 也可用)。
+    // ──────────────────────────────────────────────────────────────
+    int target_fb = (self->num_fbs >= 2) ? (1 - self->cur_fb) : 0;
+    uint8_t *dst_fb = (uint8_t *)self->fbs[target_fb];
     const uint8_t *src = (const uint8_t *)bufinfo.buf;
-    const bool src_in_psram = _dsi_is_psram_cacheable(src);
     size_t src_off = 0;
+    const int stride = self->panel_w * bpp;   // frame buffer 一行的 bytes
+    ppa_srm_color_mode_t cm = (bpp == 3) ? PPA_SRM_COLOR_MODE_RGB888
+                                         : PPA_SRM_COLOR_MODE_RGB565;
+    // CPU fallback 寫過的外接矩形 (只 flush 這些區域 — 不能 flush PPA 寫過的
+    // 區域: CPU cache 裡是舊值, C2M 會把舊值蓋回 PSRAM 覆蓋 PPA 的 DMA 結果)
+    int crx = self->panel_w, cry = self->panel_h, crx2 = 0, cry2 = 0;
+
     for (int k = 0; k < nsegs; k++) {
-        size_t seg_bytes = (size_t)seg_w[k] * seg_h[k] * (size_t)bpp;
-        const void *draw_src = src + src_off;
-        if (!src_in_psram && seg_bytes > 0) {
-            // bounce 到 PSRAM 再 draw；確保 bounce >= seg_bytes
-            if (_dsi_ensure_bounce(self, seg_bytes)) {
-                memcpy(self->bounce_buf, src + src_off, seg_bytes);
-                draw_src = self->bounce_buf;
-            }
-            // 若 bounce 配置失敗: 回退原 src, IDF 只會印 ERROR 不影響功能
-        }
-        esp_err_t ret = esp_lcd_panel_draw_bitmap(
-            self->dpi_panel, seg_x[k], seg_y[k],
-            seg_x[k] + seg_w[k], seg_y[k] + seg_h[k],
-            draw_src);
-        if (ret != ESP_OK) {
-            // 失敗: 釋放 queue 槽 (清除剩餘段計數)
-            self->pending_segments[idx] = 0;
-            self->done_flags[idx] = true;
-            self->ref_bufs[idx] = mp_const_none;
-            self->queue_head = (self->queue_head + 1) % self->queue_depth;
-            self->queue_count--;
-            mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("draw_bitmap failed err=0x%x"), ret);
-        }
+        int x = seg_x[k], y = seg_y[k], w = seg_w[k], h = seg_h[k];
+        size_t seg_bytes = (size_t)w * h * bpp;
+        const void *blit_src = src + src_off;
         src_off += seg_bytes;
-        if (k < nsegs - 1) {
-            // 等本段完成 (回呼遞減 pending_segments) 才能發下一段
-            int expect = nsegs - (k + 1);
-            while (self->pending_segments[idx] > expect) {
-                mp_hal_delay_ms(1);
+
+        bool done = false;
+        if (self->ppa_client != NULL) {
+            // DRAM src → PPA 內部 msync 會報 invalid addr → 先 bounce 到 PSRAM
+            if (!_dsi_is_psram(blit_src)) {
+                if (_dsi_ensure_bounce(self, seg_bytes)) {
+                    memcpy(self->bounce_buf, blit_src, seg_bytes);
+                    blit_src = self->bounce_buf;
+                } else {
+                    blit_src = NULL;   // bounce OOM → 本段退回 CPU
+                }
+            }
+            if (blit_src != NULL) {
+                ppa_srm_oper_config_t op = {0};
+                op.in.buffer = blit_src;
+                op.in.pic_w = w;
+                op.in.pic_h = h;
+                op.in.block_w = w;
+                op.in.block_h = h;
+                op.in.block_offset_x = 0;
+                op.in.block_offset_y = 0;
+                op.in.srm_cm = cm;
+                op.out.buffer = dst_fb;
+                op.out.buffer_size = self->fb_size;
+                op.out.pic_w = self->panel_w;
+                op.out.pic_h = self->panel_h;
+                op.out.block_offset_x = x;
+                op.out.block_offset_y = y;
+                op.out.srm_cm = cm;
+                op.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
+                op.scale_x = 1.0f;
+                op.scale_y = 1.0f;
+                op.alpha_update_mode = PPA_ALPHA_NO_CHANGE;
+                op.mode = PPA_TRANS_MODE_BLOCKING;   // 返回即完成, bounce 可安全重用
+                if (ppa_do_scale_rotate_mirror(self->ppa_client, &op) == ESP_OK) {
+                    done = true;
+                }
+            }
+        }
+        if (!done) {
+            // CPU fallback: 逐行 memcpy (無 PPA、bounce OOM 或 PPA 報錯時)
+            uint8_t *dp = dst_fb + (size_t)y * stride + (size_t)x * bpp;
+            const uint8_t *sp = src + (src_off - seg_bytes);
+            size_t row_bytes = (size_t)w * bpp;
+            for (int r = 0; r < h; r++) {
+                memcpy(dp, sp, row_bytes);
+                dp += stride;
+                sp += row_bytes;
+            }
+            // 累計 CPU 寫入的外接矩形
+            if (x < crx) crx = x;
+            if (y < cry) cry = y;
+            if (x + w > crx2) crx2 = x + w;
+            if (y + h > cry2) cry2 = y + h;
+        }
+    }
+
+    // CPU fallback 寫後台 fb 走 write-back cache → 局部 C2M flush (僅 CPU 區域)。
+    // (PPA 路徑已自己處理 cache, 不需再 flush; present() 也會再做整幀 msync)
+    {
+        int rw = crx2 - crx, rh = cry2 - cry;
+        if (rw > 0 && rh > 0) {
+            uint8_t *start = dst_fb + ((size_t)cry * self->panel_w + crx) * bpp;
+            size_t bytes = (size_t)rw * rh * bpp;
+            size_t max_bytes = dst_fb + self->fb_size - start;
+            if (bytes > max_bytes) bytes = max_bytes;
+            if (bytes > 0) {
+                esp_cache_msync(start, bytes,
+                                ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
             }
         }
     }
-    return mp_obj_new_int(idx + 1);
+
+    // write() 同步完成，不佔用 queue 槽。
+    // 回傳 tid=0 表示「不需要 wait」；上層呼叫 wait(0) 直接通過。
+    return mp_obj_new_int(0);
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(dsi_write_obj, 2, dsi_write);
 
@@ -688,6 +724,10 @@ static mp_obj_t dsi_wait(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_a
 
     mp_lcd_dsi_bus_obj_t *self = (mp_lcd_dsi_bus_obj_t *)args[ARG_self].u_obj;
     int tid = args[ARG_trans_id].u_int;
+
+    // tid == 0: dsi_write 同步完成（新合約），不需要等，直接 true
+    if (tid == 0) return mp_const_true;
+
     int to  = args[ARG_timeout_ms].u_int;
     int idx = tid - 1;
 

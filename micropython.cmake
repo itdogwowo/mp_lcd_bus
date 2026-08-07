@@ -38,6 +38,20 @@ if(ESP_PLATFORM)
         list(APPEND INCLUDES ${esp_mm_includes})
     endif()
 
+    # driver/ppa.h lives in esp_driver_ppa (P4 DMA2D engine). dsi_bus.c uses
+    # ppa_register_client/ppa_do_scale_rotate_mirror for hardware 2D blit.
+    # Guard: esp_driver_ppa only exists on IDF >= 5.3 (the P4-era driver
+    # split); older builds without it simply skip this include path.
+    idf_build_get_property(build_components BUILD_COMPONENTS)
+    if("esp_driver_ppa" IN_LIST build_components)
+        idf_component_get_property(ppa_includes esp_driver_ppa INCLUDE_DIRS)
+        idf_component_get_property(ppa_dir esp_driver_ppa COMPONENT_DIR)
+        if(ppa_includes)
+            list(TRANSFORM ppa_includes PREPEND ${ppa_dir}/)
+            list(APPEND INCLUDES ${ppa_includes})
+        endif()
+    endif()
+
 else()
     set(INCLUDES
         ${CMAKE_CURRENT_LIST_DIR}
