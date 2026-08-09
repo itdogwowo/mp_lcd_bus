@@ -938,7 +938,7 @@ static mp_obj_t dsi_blit_pipeline(mp_obj_t self_in, mp_obj_t buf_in) {
     self->queue_count++;
 
     esp_err_t ret = esp_lcd_panel_draw_bitmap(
-        self->dpi_panel, 0, 0, self.panel_w, self->panel_h, self->fbs[dst]);
+        self->dpi_panel, 0, 0, self->panel_w, self->panel_h, self->fbs[dst]);
     if (ret != ESP_OK) {
         // 失敗: 釋放槽位 + 回滾管線狀態, 別卡住 queue
         self->ref_bufs[idx] = mp_const_none;
