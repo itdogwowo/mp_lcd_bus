@@ -1,0 +1,20 @@
+{
+    "name": "dsi_jd9165_1024x600",
+    "desc": "JC1060P470 10.6\" 1024x600 MIPI DSI (ESP32-P4)",
+    "bus": "dsi",
+    "driver": "JD9165",
+    "width": 1024,
+    "height": 600,
+    "pixel_format": "RGB565_BE",
+    "pre": [
+        { "type": "ldo", "chan": 3, "mv": 2500 },
+        { "type": "pin", "gpio": 23 }
+    ],
+    "dsi": {
+        "lanes": 2, "lane_bit_rate_mbps": 550.0, "dpi_clk_mhz": 58.0,
+        "hsync_pulse_width": 40, "hsync_back_porch": 160, "hsync_front_porch": 160,
+        "vsync_pulse_width": 10, "vsync_back_porch": 23, "vsync_front_porch": 12,
+        "in_color_format": 16, "fb_count": 2,
+        "rst": 27
+    }
+}

@@ -1,0 +1,13 @@
+{
+    "name": "i2c_generic_0x3C",
+    "desc": "I2C 0x3C 240x320 (generic)",
+    "bus": "i2c",
+    "driver": "ST7789",
+    "width": 240,
+    "height": 320,
+    "pixel_format": "RGB565_BE",
+    "i2c": {
+        "data": [19], "clk": 18, "addr": 60, "rst": -1,
+        "cmd_ctrl": 0, "data_ctrl": 64
+    }
+}

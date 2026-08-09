@@ -1,0 +1,24 @@
+{
+    "name": "rgb_st7701_touch_lcd4",
+    "desc": "Waveshare ESP32-S3-Touch-LCD-4 4\" 480x480 RGB (ST7701)",
+    "bus": "rgb",
+    "driver": "ST7701",
+    "width": 480,
+    "height": 480,
+    "pixel_format": "RGB565",
+    "rotation": 0,
+    "color_order": "RGB",
+    "invert": 1,
+    "pre": [
+        { "type": "ch32v003", "id": 0, "sda": 15, "scl": 7, "freq": 400000, "addr": 36, "pwm": 255 }
+    ],
+    "ctrl": { "cs": 42, "sck": 2, "mosi": 1 },
+    "rgb": {
+        "data": [46, 3, 8, 18, 17, 14, 13, 12, 11, 10, 9, 5, 45, 48, 47, 21],
+        "hsync": 38, "vsync": 39, "de": 40, "pclk": 41, "disp": -1,
+        "freq": 12000000,
+        "hsync_pulse_width": 8, "hsync_back_porch": 50, "hsync_front_porch": 10,
+        "vsync_pulse_width": 8, "vsync_back_porch": 20, "vsync_front_porch": 10,
+        "hsync_idle_low": 0, "vsync_idle_low": 0
+    }
+}

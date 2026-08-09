@@ -796,13 +796,14 @@ static MP_DEFINE_CONST_FUN_OBJ_1(dsi_back_buffer_obj, dsi_back_buffer);
 // 顯示目標, 在幀邊界 (VSYNC) 原子切換 (IDF 的 page-flip 優化: draw_bitmap 來源是
 // 內部 fb → 只 cache writeback + 切 cur_fb_index, 不拷貝)。
 //
-// 流程全在 C 內部 (老奉收這裡): 選離屏 → draw_bitmap 觸發切換 → 入 queue 槽
+// 流程全在 C 內部: 選離屏 → draw_bitmap 觸發切換 → 入 queue 槽
 // (slot_kind=1, 等幀邊界) → 回 tid。Python 端用既有 wait(tid)/wait_all() 等完成,
 // 與 write() 完全同款契約, 零新 wait API。
 //
-// ⚠ 使用慣例: present 前應已 wait 完先前的 write (adapter 自然滿足)。
-// IDF page-flip 路徑會同步回呼 on_color_trans_done, 若此時有未完成的 DMA 槽,
-// 會被提前標記完成 (拷貝本身不受影響, 僅 wait 語義提前)。
+// ⚠ 效能關鍵 (2026-08): 不要在這裡做顯式 esp_cache_msync — IDF draw_bitmap 的
+// no-copy 路徑 (src == 內部 fb) 自己會做全幀 C2M (esp_lcd_panel_dpi.c)。
+// 再做一次 = 每幀重複寫回 1.2MB PSRAM (~6-8ms), 使每幀工作量超過幀週期,
+// wait 相位鎖定在 2×幀週期 (65Hz → 31ms/幀 → 32 FPS)。
 static mp_obj_t dsi_present(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     enum { ARG_self, ARG_timeout_ms };
     static const mp_arg_t allowed[] = {
@@ -831,17 +832,8 @@ static mp_obj_t dsi_present(size_t n_args, const mp_obj_t *pos_args, mp_map_t *k
     self->queue_tail = (self->queue_tail + 1) % self->queue_depth;
     self->queue_count++;
 
-    // ⚠ 先顯式 msync 離屏 fb：Python 端 back_buffer()[:] = data 是 CPU 直接
-    // 寫 PSRAM，經 write-back L2 cache。DPI DMA 讀 PSRAM **bypass cache**，
-    // 不把髒行寫回 DMA 就會看到舊內容 (殘留/黑帶/閃爍)。
-    // IDF 的 draw_bitmap page-flip fast path (src == 內部 fb) 不一定會做
-    // 全範圍 C2M，因此主動做一次，與 dsi_flush() 同義。
-    if (self->fbs[back] != NULL && self->fb_size > 0) {
-        esp_cache_msync(self->fbs[back], self->fb_size,
-                        ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
-    }
-
-    // IDF 範圍檢查命中內部 fb → 只 cache writeback + 幀邊界切 cur_fb_index (不拷貝)
+    // IDF 範圍檢查命中內部 fb → 只做 cache writeback + 切 cur_fb_index (不拷貝)。
+    // cache 一致性由 IDF no-copy 路徑的 esp_cache_msync 負責 — 見上方效能註解。
     esp_err_t ret = esp_lcd_panel_draw_bitmap(
         self->dpi_panel, 0, 0, self->panel_w, self->panel_h, self->fbs[back]);
     if (ret != ESP_OK) {
@@ -854,9 +846,7 @@ static mp_obj_t dsi_present(size_t n_args, const mp_obj_t *pos_args, mp_map_t *k
         mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("present (draw_bitmap) failed err=0x%x"), ret);
     }
 
-    // 0 幀等待: 若上層要非同步 (直接拿 tid), 不在此阻塞。這裡只回 tid,
-    // 等/不等由上層決定 (wait(tid) 或繼續)。timeout_ms 參數保留給未來「同步等到完成」
-    // 的便利形式 — 目前非同步 (與 write() 一致, 回 tid)。
+    // 非同步 (與 write() 一致, 回 tid); 等/不等由上層決定 (wait(tid) 或繼續)。
     (void)args[ARG_timeout_ms].u_int;
     return mp_obj_new_int(idx + 1);    // tid — 與 write() 同契約
 }

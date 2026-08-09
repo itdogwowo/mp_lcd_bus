@@ -1,0 +1,17 @@
+{
+    "name": "i80_st7789_240x320",
+    "desc": "ST7789 2.4\" 240x320 8080 並行",
+    "bus": "i80",
+    "driver": "ST7789",
+    "width": 240,
+    "height": 320,
+    "pixel_format": "RGB565_BE",
+    "pre": [
+        { "type": "pin", "gpio": 40 }
+    ],
+    "i80": {
+        "data": [0, 1, 2, 3, 4, 5, 6, 7],
+        "wr": 10, "dc": 9, "cs": -1, "rst": 39,
+        "freq": 10000000, "variant": 0
+    }
+}

@@ -1,0 +1,17 @@
+{
+    "name": "spi_st7789_240x320",
+    "desc": "ST7789 2.4\" 240x320 SPI",
+    "bus": "spi",
+    "driver": "ST7789",
+    "width": 240,
+    "height": 320,
+    "pixel_format": "RGB565_BE",
+    "pre": [
+        { "type": "pin", "gpio": 40 }
+    ],
+    "spi": {
+        "host": 1, "clk": 36, "data": [35],
+        "dc": 37, "cs": 38, "rst": 39,
+        "freq": 40000000, "variant": 0
+    }
+}

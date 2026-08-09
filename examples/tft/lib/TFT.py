@@ -1196,6 +1196,131 @@ class RM67162(TFT):
             self.write_cmd_data(0x51, b'\xD0')   # Brightness MAX
 
 
+class ST7701CtrlSPI:
+    """ST7701 控制通道 — 3-wire 9-bit 軟件 SPI (bit-bang)。
+
+    RGB 面板像素走並行 bus，寄存器初始化走此通道。
+    協議 (與 Arduino_GFX Arduino_SWSPI 一致): CS 拉低 → 1 bit DC
+    (0=cmd, 1=data) + 8 bit data, MSB first, SCK 上升沿取樣。
+    只在 init 時用一次，bit-bang 速度足夠。"""
+    def __init__(self, cs, sck, mosi):
+        import machine
+        self._cs = machine.Pin(cs, machine.Pin.OUT, value=1)
+        self._sck = machine.Pin(sck, machine.Pin.OUT, value=0)
+        self._mosi = machine.Pin(mosi, machine.Pin.OUT, value=0)
+
+    def _write_byte(self, dc, byte):
+        self._cs.value(0)
+        self._mosi.value(dc)
+        self._sck.value(1)
+        self._sck.value(0)
+        for i in range(7, -1, -1):
+            self._mosi.value((byte >> i) & 1)
+            self._sck.value(1)
+            self._sck.value(0)
+        self._cs.value(1)
+
+    def write_cmd(self, cmd):
+        self._write_byte(0, cmd)
+
+    def write_data(self, data):
+        self._write_byte(1, data)
+
+    def write_cmd_data(self, cmd, data=None):
+        self.write_cmd(cmd)
+        if data:
+            for b in data:
+                self.write_data(b)
+
+
+class ST7701(TFT):
+    """ST7701 RGB 面板驅動 (如 Waveshare ESP32-S3-Touch-LCD-4, 4" 480x480)。
+
+    與 SPI 面板的差異:
+      * 像素不走 RAMWR — RGB 並行 bus 持續掃描 (RgbBusAdapter)。
+      * init sequence 走 3-wire 9-bit 控制 SPI (ST7701CtrlSPI)，
+        腳位由外部傳入 (如 LCD-4: cs=42, sck=2, mosi=1)。
+      * init 表與 Arduino_GFX st7701_type1_init_operations 逐項一致。
+      * 面板 reset/電源由外部 (CH32V003 IO expander) 管理。
+      * colmod (0x3A): 0x50=RGB565 / 0x60=RGB666 / 0x70=RGB888，
+        Waveshare 官方用 0x60，可透過 config 覆寫。
+    """
+    # (cmd, data, delay_ms) — 0xFF = page 切換, 順序不可調換
+    INIT = [
+        (0xFF, b'\x77\x01\x00\x00\x10', 0),
+        (0xC0, b'\x3B\x00', 0),
+        (0xC1, b'\x0D\x02', 0),
+        (0xC2, b'\x31\x05', 0),
+        (0xCD, b'\x08', 0),
+        (0xB0, b'\x00\x11\x18\x0E\x11\x06\x07\x08\x07\x22\x04\x12\x0F\xAA\x31\x18', 0),
+        (0xB1, b'\x00\x11\x19\x0E\x12\x07\x08\x08\x08\x22\x04\x11\x11\xA9\x32\x18', 0),
+        (0xFF, b'\x77\x01\x00\x00\x11', 0),
+        (0xB0, b'\x60', 0),
+        (0xB1, b'\x32', 0),
+        (0xB2, b'\x07', 0),
+        (0xB3, b'\x80', 0),
+        (0xB5, b'\x49', 0),
+        (0xB7, b'\x85', 0),
+        (0xB8, b'\x21', 0),
+        (0xC1, b'\x78', 0),
+        (0xC2, b'\x78', 0),
+        (0xE0, b'\x00\x1B\x02', 0),
+        (0xE1, b'\x08\xA0\x00\x00\x07\xA0\x00\x00\x00\x44\x44', 0),
+        (0xE2, b'\x11\x11\x44\x44\xED\xA0\x00\x00\xEC\xA0\x00\x00', 0),
+        (0xE3, b'\x00\x00\x11\x11', 0),
+        (0xE4, b'\x44\x44', 0),
+        (0xE5, b'\x0A\xE9\xD8\xA0\x0C\xEB\xD8\xA0\x0E\xED\xD8\xA0\x10\xEF\xD8\xA0', 0),
+        (0xE6, b'\x00\x00\x11\x11', 0),
+        (0xE7, b'\x44\x44', 0),
+        (0xE8, b'\x09\xE8\xD8\xA0\x0B\xEA\xD8\xA0\x0D\xEC\xD8\xA0\x0F\xEE\xD8\xA0', 0),
+        (0xEB, b'\x02\x00\xE4\xE4\x88\x00\x40', 0),
+        (0xEC, b'\x3C\x00', 0),
+        (0xED, b'\xAB\x89\x76\x54\x02\xFF\xFF\xFF\xFF\xFF\xFF\x20\x45\x67\x98\xBA', 0),
+        (0xFF, b'\x77\x01\x00\x00\x13', 0),
+        (0xE5, b'\xE4', 0),
+        (0xFF, b'\x77\x01\x00\x00\x00', 0),
+        (0x21, None, 0),      # 反轉 (IPS); init() 依 _inverted 換 0x20/0x21
+        (0x3A, b'\x60', 0),   # COLMOD; init() 依 _colmod 覆寫
+        (0x11, None, 120),    # Sleep Out
+        (0x29, None, 120),    # Display On
+    ]
+
+    def __init__(self, adapter, width=480, height=480, ctrl=None, colmod=None,
+                 rotation=0, color_order="RGB", invert=True,
+                 pixel_format="RGB565", bytes_per_pixel=2):
+        self._ctrl = ctrl
+        self._colmod = 0x60 if colmod is None else int(colmod)
+        super().__init__(adapter=adapter, width=width, height=height,
+                         pixel_format=pixel_format, bytes_per_pixel=bytes_per_pixel)
+        self._rotation = rotation
+        self._color_order = color_order.upper()
+        self._inverted = invert
+        self.init()
+
+    def init(self):
+        if self._ctrl is None:
+            raise RuntimeError("ST7701 needs a control SPI (ctrl=) for init")
+        for cmd, data, delay in self.INIT:
+            if cmd == 0x3A:
+                data = bytes([self._colmod])
+            elif cmd in (0x20, 0x21):
+                cmd = 0x21 if self._inverted else 0x20
+            self._ctrl.write_cmd_data(cmd, data)
+            if delay:
+                _sleep_ms(delay)
+        self.set_window(0, 0)
+
+    def _update_rotation(self):
+        pass  # RGB 面板無 MADCTL，旋轉由上層 framebuffer 處理
+
+    def _update_color_order(self):
+        pass
+
+    def _update_inversion(self):
+        if self._ctrl is not None:
+            self._ctrl.write_cmd(0x21 if self._inverted else 0x20)
+
+
 class SH8601(TFT):
     """Waveshare AMOLED 1.91" 536x240 QSPI (SH8601)"""
     def __init__(self, spi=None, dc=None, cs=None, rst=None, width=536, height=240,

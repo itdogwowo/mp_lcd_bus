@@ -38,28 +38,75 @@ Adapter 實作（各總線的 cmd 規劃見各類別 docstring）：
 
 完整轉移自 mp_Net-Core：`VideoStreamReader` + `TFT` 基類 + 面板子類
 （ST7735 / ST7789 / ST7796 / GC9A01 / ILI9341 / GC9D01 / NV3030B /
-RM67162 / SH8601），新增 **`JD9165`**（1024x600 MIPI DSI）。
+RM67162 / SH8601），新增 **`JD9165`**（1024x600 MIPI DSI）與 **`ST7701`**
+（480x480 RGB，如 Waveshare ESP32-S3-Touch-LCD-4，init 走 `ST7701CtrlSPI`
+3-wire 9-bit 控制通道）。
 
 TFT API（所有面板一致）：`show()` / `show_async()` / `show_frame()` /
 `begin_display()` + `present()` + `present_wait()` / `set_rotation()` /
 `set_color_order()` / `invert_display()` / `fill()` / framebuf 相容。
 
-## 層次 3 — 全能測試工具（`tft_test_tool.py`）
+## 層次 3 — 全能測試工具（`tft_test_tool.py` + `boards/`）
 
-**一個檔案測所有屏幕**：頂部 ⚙ 設定區改 `BUS` / `DRIVER` / 解析度 / 各 bus 參數，
-不用改任何其他程式碼：
+**三層解耦，每層只吃上一層的產物**，互不綁定：
+
+```
+Layer 1  create_bus(cfg)              → (bus, adapter, holds)  # 電源/reset + bus + adapter
+Layer 2  create_panel(cfg, adapter)   → tft                    # 依 driver 名建面板驅動
+Layer 3  TftTest(tft, w, h, ...)      → run_all()              # 測試只認 tft 物件
+Runner   run(board)                   → config → bus → panel → 測試 → deinit
+```
+
+**一板一 config**：`boards/<板名>/config.json`，自行增刪板子，每次只讀一個：
 
 ```python
 import tft_test_tool
-tft_test_tool.run_all()          # 依 ⚙ 設定區自動初始化 → FPS×3 → flush → 目視
+tft_test_tool.list_boards()                     # 看 boards/ 下有哪些板子
+tft_test_tool.run("dsi_jd9165_1024x600")       # 測指定板子
+tft_test_tool.run(config_path="my.json")       # 或直接給 config 路徑
+tft_test_tool.run()                            # 不給名 → 列出可用板子
 ```
 
-| 設定 | 可選值 |
+也可逐層手動組合（不透過 Runner）：
+
+```python
+cfg = tft_test_tool.load_board("spi_st7789_240x320")
+bus, adapter, holds = tft_test_tool.create_bus(cfg)   # Layer 1
+tft = tft_test_tool.create_panel(cfg, adapter)        # Layer 2
+test = tft_test_tool.TftTest(tft, 240, 320, "spi", raw_bus=bus)
+test.fps_test()                                       # Layer 3 單項或 test.run_all()
+bus.deinit()
+```
+
+### boards/<板名>/config.json 結構
+
+單板 config（無 profiles 包裝層，直接是板子描述）：
+
+```json
+{
+    "name": "rgb_st7701_touch_lcd4",
+    "desc": "Waveshare ESP32-S3-Touch-LCD-4 4\" 480x480 RGB (ST7701)",
+    "bus": "rgb|spi|i80|dsi|i2c",
+    "driver": "ST7701|ST7789|...",
+    "width": 480, "height": 480,
+    "pixel_format": "RGB565_BE",
+    "pre":  [ { "type": "ch32v003|ldo|pin", ... } ],
+    "ctrl": { "cs": 42, "sck": 2, "mosi": 1 },
+    "rgb":  { "data": [...16 pins], "hsync": 38, ...timing... }
+}
+```
+
+| 欄位 | 說明 |
 |---|---|
-| `BUS` | `spi` / `i80` / `rgb` / `dsi` / `i2c` |
-| `DRIVER` | ST7735 / ST7789 / ST7796 / GC9A01 / ILI9341 / GC9D01 / NV3030B / RM67162 / SH8601 / **JD9165** |
-| `WIDTH` / `HEIGHT` | 依面板 |
-| `SPI` / `I80` / `RGB` / `DSI` / `I2C` dict | 各 bus 的腳位 / timing / 頻率 |
+| `pre` | bus 建立前的電源/reset 前置動作：`ldo`(P4 DSI PHY) / `pin`(背光拉高) / `ch32v003`(LCD-4 的 IO expander 開機序列+背光 PWM) |
+| `ctrl` | ST7701 等 RGB 面板的 3-wire 控制 SPI 腳位 |
+| `rgb` | RGB 並行腳位 + hsync/vsync porch/pulse timing + `freq` (pclk)，選填 `bb_size_px` / `queue_depth` / `colmod` |
+| `dsi`/`spi`/`i80`/`i2c` | 各 bus 參數，欄位名與 `lcd_bus.*Bus()` kwargs 對應 |
+
+內建 5 個板子：`rgb_st7701_touch_lcd4`（Waveshare 4" RGB）、
+`dsi_jd9165_1024x600`（P4）、`spi_st7789_240x320`、`i80_st7789_240x320`、
+`i2c_generic_0x3C`。新增板子 = 複製一個資料夾改 config，不用動程式碼。
+`load_board()` 相容舊格式 `{"LCD": {"profiles": ...}}`（自動取 active profile）。
 
 測試項目（全部走 TFT 統一介面，任何 bus/面板通用）：
 
@@ -68,6 +115,9 @@ tft_test_tool.run_all()          # 依 ⚙ 設定區自動初始化 → FPS×3 �
 | `fps_test` | adapter 層純吞吐（`write_frame_dma`） |
 | `fps_test_tft` | TFT.show_frame 層（library 開銷） |
 | `fps_test_present` | begin_display + present 管線 |
+| `fps_test_blit` | 整頁原子更新（blit/page-flip） |
+| `fps_breakdown` | DSI 分段計時：write vs present+wait |
+| `vsync_period` | 面板真實幀週期（只翻頁不寫像素） |
 | `flush_bench` | flush/wait_all 代價 |
 | `test_streaming` | **隱性視窗** — 不 set_window 連續分批寫入（自動接續 + wrap） |
 | `test_window` | **顯式 set_window** — 區域獨立更新（上半/下半/中條） |

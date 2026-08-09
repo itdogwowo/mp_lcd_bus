@@ -580,6 +580,16 @@ class RgbBusAdapter(BusAdapter):
     def write_cmd_data(self, cmd, data=None):
         self._log_warn("write_cmd_data ignored (RGB bus has no command interface)")
 
+    def write_frame(self, data):
+        """整幀傳輸 (RGB: 流式寫入 + flush, 對齊其他 adapter 語義)"""
+        self.write_data_async(data)
+        self.flush()
+
+    def write_frame_dma(self, data, chunk=32768):
+        """對齊 SPI adapter: 回傳 tid 列表 (RGB write 異步 DMA)"""
+        tid = self.write_data_async(data, chunk)
+        return [tid] if tid is not None else []
+
     @staticmethod
     def _log_err(where, e):
         try:
@@ -624,6 +634,10 @@ class DsiBusAdapter(BusAdapter):
     撕裂: write() 永不寫前台 → 零撕裂；present() 才在 VSYNC 原子切換 → 零撕裂
           使用者唯一要做的事：「寫完後 call present() 就看到新畫面」
           fb_count=1 則退化為寫前台 (存在撕裂風險, 不鼓勵但不強制阻擋)
+
+    ⚠ 同步合約: write() C 層同步完成 (回 tid=0, wait(0) 直接通過);
+    present() 異步入隊回 tid, wait(tid) 等到下一個幀邊界 (VSYNC) 才算完成
+    (IDF draw_bitmap 對內部 fb 只做 cache writeback + 切 fb index, 非阻塞)。
     """
     def __init__(self, bus, width, height):
         self._bus = bus
@@ -661,10 +675,13 @@ class DsiBusAdapter(BusAdapter):
     def show_atomic(self, data, w, h):
         """整頁零撕裂更新 — 後台寫入 + present 切換。
 
-        簡單原則：雙緩開啟時，寫後台 → 切前台，別讓使用者選、不用懂 API 歷史包袱。"""
+        簡單原則：雙緩開啟時，寫後台 → 切前台，別讓使用者選、不用懂 API 歷史包袱。
+        走 C write() (PPA 硬體搬運; src 在 PSRAM 時零拷貝), 避免
+        back_buffer()[:]=data 的 CPU 整幀拷貝 + present 整幀 cache 寫回。"""
         if not self._pflip:
             return super().show_atomic(data, w, h)   # 退化 (命令式)
-        self._bus.back_buffer()[:] = data            # 寫進 C 選的離屏 fb
+        self._bus.set_window(0, 0, w - 1, h - 1)     # 視窗=整頁, 流式位置歸零
+        self._bus.write(data)                        # PPA → 後台 fb (不碰前台, 零撕裂)
         tid = self._bus.present()                    # C: 選離屏+flip+入隊, 回 tid
         if self._dma and tid is not None:
             self._bus.wait(tid)                      # 等幀邊界 (與 write 同款)
