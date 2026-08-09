@@ -622,6 +622,31 @@ class TftTest:
         print("FPS(blit): {:.0f}  ({:.1f} ms/frame, {:.1f} MB/s)".format(
             fps, elapsed / frames * 1000, mbps))
 
+    def fps_test_pipeline(self, frames=50):
+        """3-fb 管線 FPS — DSI fb_count>=3 專用。
+
+        CPU memcpy 直寫閒置 fb + 3 緩衝輪轉,讓「拷貝」與「DMA 掃上一幀」重疊。
+        對照 FPS(blit) (PPA 序列路徑) 驗證管線化效益。目標逼近面板上限 (~65 FPS)。"""
+        if self.bus_type != "dsi":
+            print("FPS(pipeline): 僅 DSI 適用, 略過")
+            return
+        if not getattr(self.tft._bus, "_pipeline", False):
+            print("FPS(pipeline): 需 fb_count>=3, 略過")
+            return
+        gc.collect()
+        total = self.w * self.h * 2
+        full_w, full_b = _make_test_frames(total)
+        bus = self.tft._bus
+        t0 = time.ticks_us()
+        for n in range(frames):
+            tid = bus.blit_pipeline(full_w if n & 1 else full_b)
+            bus.blit_pipeline_wait(tid)
+        elapsed = time.ticks_diff(time.ticks_us(), t0) / 1_000_000
+        fps = frames / elapsed
+        mbps = total * frames / elapsed / (1024 * 1024)
+        print("FPS(pipeline): {:.0f}  ({:.1f} ms/frame, {:.1f} MB/s)".format(
+            fps, elapsed / frames * 1000, mbps))
+
     def fps_breakdown(self, frames=30):
         """DSI 分段計時 — 定位 write() 與等幀邊界各佔多少。
         t_write 大 → blit/cache 是瓶頸; t_wait 大且 ≈ 整數倍幀週期 → 相位鎖定。"""
@@ -664,6 +689,96 @@ class TftTest:
             self.raw.wait(tid)
         elapsed = time.ticks_diff(time.ticks_us(), t0) / 1_000_000
         print("FPS(vsblank): {:.0f}  ({:.2f} ms/frame)".format(frames / elapsed, elapsed / frames * 1000))
+
+    def dsi_writepath_breakdown(self, frames=30):
+        """DSI write 路徑分段量測 — 量化「拷貝 vs 翻頁」各佔多少,決定修法方向。
+
+        目標:確認 write=25.6ms 是 PPA blit 本身,還是 bounce memcpy / cache 開銷,
+        以及「直寫 fb + present」是否比「write(PPA) + present」更快。
+        每項輸出 ms/幀 (MB/s);MB/s 以幀位元組數計算 (僅 #1-3,#5 有像素搬運)。"""
+        if self.bus_type != "dsi" or self.raw is None:
+            print("  writepath breakdown: 僅 DSI 適用, 略過")
+            return
+        gc.collect()
+        total = self.w * self.h * 2
+        raw = self.raw
+        mb = total / 1024 / 1024
+
+        def _ms_per_frame(elapsed_us):
+            return elapsed_us / frames / 1000
+
+        def _mbps(elapsed_us):
+            s = elapsed_us / 1_000_000
+            return mb * frames / s if s > 0 else 0.0
+
+        # ── #1 PPA blit, PSRAM src (現況 write() 路徑, 零 bounce) ──
+        psram_src = _alloc_psram_frame(total)
+        psram_src[:] = b'\xff\xff' * (total // 2)
+        raw.set_window(0, 0, self.w - 1, self.h - 1)
+        t0 = time.ticks_us()
+        for _ in range(frames):
+            raw.write(psram_src)
+        t1_a = time.ticks_diff(time.ticks_us(), t0)
+        t1_ms = _ms_per_frame(t1_a)
+        print("  #1 write PPA (PSRAM src) : {:.2f} ms/幀  ({:.1f} MB/s)".format(t1_ms, _mbps(t1_a)))
+
+        # ── #2 PPA blit, DRAM src (強制走 bounce memcpy 路徑) ──
+        #   P4 內部 DRAM ≈ 700KB < 1.17MB 整幀 → 配不到時降級告知, 不中斷量測。
+        dram_src = None
+        try:
+            import heap_caps
+            dram_src = heap_caps.malloc(total, heap_caps.CAP_INTERNAL | heap_caps.CAP_8BIT)
+        except Exception:
+            pass
+        if dram_src is not None:
+            dram_src[:] = b'\x00\xf8' * (total // 2)
+            raw.set_window(0, 0, self.w - 1, self.h - 1)
+            t0 = time.ticks_us()
+            for _ in range(frames):
+                raw.write(dram_src)
+            t2_a = time.ticks_diff(time.ticks_us(), t0)
+            t2_ms = _ms_per_frame(t2_a)
+            print("  #2 write PPA (DRAM  src) : {:.2f} ms/幀  ({:.1f} MB/s)  Δ={:+.2f} vs #1 (bounce 代價)".format(
+                t2_ms, _mbps(t2_a), t2_ms - t1_ms))
+        else:
+            print("  #2 write PPA (DRAM  src) : 跳過 (內部 DRAM < {:.2f}MB, 配不到整幀)".format(mb))
+
+        # ── #3 CPU memcpy 直寫 fb (back_buffer view, 不經 PPA) ──
+        back_view = raw.back_buffer()
+        t0 = time.ticks_us()
+        for _ in range(frames):
+            back_view[:] = psram_src
+        t1 = time.ticks_diff(time.ticks_us(), t0)
+        t3_ms = _ms_per_frame(t1)
+        print("  #3 back_buf[:]= (CPU memcpy): {:.2f} ms/幀  ({:.1f} MB/s)".format(t3_ms, _mbps(t1)))
+
+        # ── #4 純 present 連續翻頁 (頁面翻轉天花板, 應 ≈ vsblank) ──
+        #   先翻一次穩定 cur_fb
+        tid = raw.present(); raw.wait(tid)
+        t0 = time.ticks_us()
+        for _ in range(frames):
+            tid = raw.present()
+            raw.wait(tid)
+        t1 = time.ticks_diff(time.ticks_us(), t0)
+        print("  #4 present only (翻頁天花板): {:.2f} ms/幀  ({:.0f} FPS)".format(
+            _ms_per_frame(t1), frames / (t1 / 1_000_000) if t1 > 0 else 0))
+
+        # ── #5 back_buffer 直寫 + present 端到端 (對照 write+present) ──
+        raw.set_window(0, 0, self.w - 1, self.h - 1)
+        t0 = time.ticks_us()
+        for _ in range(frames):
+            back_view[:] = psram_src
+            tid = raw.present()
+            raw.wait(tid)
+        t1 = time.ticks_diff(time.ticks_us(), t0)
+        t5_ms = _ms_per_frame(t1)
+        print("  #5 back_buf + present (端到端): {:.2f} ms/幀  ({:.1f} MB/s, {:.0f} FPS)".format(
+            t5_ms, _mbps(t1), frames / (t1 / 1_000_000) if t1 > 0 else 0))
+
+        # ── 解讀提示 ──
+        print("  ─ 解讀: #1 若 ≈25ms → PPA blit 本身慢 (走管線化); "
+              "#3 < #1 → back_buffer 直寫是更快替代; "
+              "#2 > #1 → PSRAM 配置關鍵")
 
     def flush_bench(self):
         """flush()/wait_all() 代價實測"""
@@ -732,7 +847,10 @@ class TftTest:
         self._clear(); time.sleep_ms(300)
         self.fps_test_blit(50)
         self._clear(); time.sleep_ms(300)
+        self.fps_test_pipeline(50)
+        self._clear(); time.sleep_ms(300)
         self.fps_breakdown(30)
+        self.dsi_writepath_breakdown(30)
         self.vsync_period(50)
         self._clear(); time.sleep_ms(300)
         self.flush_bench()

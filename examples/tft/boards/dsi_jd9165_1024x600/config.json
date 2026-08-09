@@ -14,7 +14,7 @@
         "lanes": 2, "lane_bit_rate_mbps": 550.0, "dpi_clk_mhz": 58.0,
         "hsync_pulse_width": 40, "hsync_back_porch": 160, "hsync_front_porch": 160,
         "vsync_pulse_width": 10, "vsync_back_porch": 23, "vsync_front_porch": 12,
-        "in_color_format": 16, "fb_count": 2,
+        "in_color_format": 16, "fb_count": 3,
         "rst": 27
     }
 }

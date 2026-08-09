@@ -646,6 +646,8 @@ class DsiBusAdapter(BusAdapter):
         self._dma = hasattr(bus, 'wait') and hasattr(bus, 'pending')
         # page-flip 能力: C 層需暴露 back_buffer() + present() (fb_count>=2)
         self._pflip = hasattr(bus, 'back_buffer') and hasattr(bus, 'present')
+        # 3-fb 管線能力: C 層需暴露 blit_pipeline() (fb_count>=3)
+        self._pipeline = hasattr(bus, 'blit_pipeline')
 
     def write_cmd(self, cmd):
         # video mode 無視窗/RAMWR 命令 → 忽略 (保留 set_window/present 語義)
@@ -693,6 +695,27 @@ class DsiBusAdapter(BusAdapter):
             tid = self._bus.present()
             if self._dma and tid:
                 self._bus.wait(tid)
+
+    def blit_pipeline(self, data):
+        """3-fb 管線整幀更新 (fb_count>=3 才能用, 否則 ValueError)。
+
+        與 show_atomic 的差別:走 CPU memcpy 直寫閒置 fb(舍棄較慢的 PPA blit),
+        並用 3 緩衝輪轉讓「拷貝」與「DMA 掃上一幀」重疊 → 逼近面板上限 (~65 FPS)。
+        C 層 blit_pipeline 內部:
+          1. 等上一個 pending 翻頁完成 (IDF 單 flip 限制)
+          2. memcpy(data → 閒置 fb)  ← 與 DMA 掃描並行, 不撕裂
+          3. draw_bitmap 提交 page-flip (VSYNC 原子切換)
+          4. 回 tid; wait(tid) 等本幀翻靬完成
+        上層用法: tid = blit_pipeline(buf); ...做別的事...; blit_pipeline_wait(tid)。
+        若只連續 blit_pipeline 不等,C 層會在下次開頭等 (自動背壓)。"""
+        if not self._pipeline:
+            raise ValueError("blit_pipeline needs fb_count>=3")
+        return self._bus.blit_pipeline(data)
+
+    def blit_pipeline_wait(self, tid):
+        """等 blit_pipeline 回的 tid 翻頁完成 (同 wait(tid) 語義)。"""
+        if self._dma and tid:
+            self._bus.wait(tid)
 
     def write_frame_dma(self, data, chunk=32768):
         """對齊 SPI adapter：回傳 tids 列表 (DSI C 層同步, tid=0 但仍回來)"""

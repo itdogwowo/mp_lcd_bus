@@ -79,6 +79,13 @@ static bool on_refresh_done(esp_lcd_panel_handle_t panel,
             self->slot_kind[i] = 0;      // ⚠ 必重置: 不重置則下次 write() 輪到此槽
             self->queue_head = (self->queue_head + 1) % self->queue_depth;   // 會被當 present 槽跳過 → 卡死
             self->queue_count--;
+            // 3-fb 管線: 若完成的是 blit_pipeline 提交的 slot,
+            // 釋放 pending → 該 fb 從「待翻」變「顯示中」,上一個顯示中 fb 變可寫。
+            // (DMA EOF callback 在 IDF 重 arm 到新 fb 之後觸發,故此時翻頁已生效)
+            if (self->pl_pending_tid == i) {
+                self->pl_pending_fb = -1;
+                self->pl_pending_tid = -1;
+            }
             break;   // 一個幀邊界只對應一個 present 槽
         }
     }
@@ -285,6 +292,10 @@ static mp_obj_t dsi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     memset(self->slot_kind, 0, sizeof(self->slot_kind));
     self->queue_head = self->queue_tail = self->queue_count = 0;
     self->cur_fb = 0;       // fb0 為初始顯示中; back_buffer()/present() 用 1-cur_fb 選離屏
+    // 3-fb 管線初始狀態: 無 pending, 可寫 fb = 1 (fb0 顯示中, fb1 可寫, fb2 備用)
+    self->pl_free_fb = 1;
+    self->pl_pending_fb = -1;
+    self->pl_pending_tid = -1;
     // 視窗預設全螢幕, 流式位置從 (0,0) 開始
     self->win_x0 = self->win_y0 = 0;
     self->win_x1 = self->panel_w - 1;
@@ -853,6 +864,94 @@ static mp_obj_t dsi_present(size_t n_args, const mp_obj_t *pos_args, mp_map_t *k
 static MP_DEFINE_CONST_FUN_OBJ_KW(dsi_present_obj, 1, dsi_present);
 
 
+// blit_pipeline(buf) — 3-fb 管線整幀更新 (fb_count>=3 才能用)。
+//
+// 三角色同時存在,達成「CPU 拷貝與 DMA 掃描重疊」逼近面板上限 (~65 FPS):
+//   cur_fb        正在掃描顯示 (DMA 讀)
+//   pl_pending_fb 已提交等下一個 VSYNC (IDF draw_bitmap 同步 msync + 設 cur_fb_index)
+//   pl_free_fb    CPU 正在 memcpy 寫入 (本函式目標)
+//
+// 流程 (每次呼叫):
+//   1. 若有 pending (上一幀還在等 VSYNC), 等 on_refresh_done 釋放 (pl_pending_fb==-1)
+//      → IDF DPI 同一時間只允許 1 個 pending flip, 這步確保不會覆蓋上一個
+//   2. memcpy(buf → fbs[pl_free_fb])        ← 14.5ms, 與 DMA 掃上一幀並行
+//   3. draw_bitmap(fbs[pl_free_fb])          ← IDF 同步 msync + 設 cur_fb_index
+//   4. 入 queue slot (slot_kind=1, 復用 present 路徑) → 回 tid
+//   5. pl_pending_fb/tid 設為本幀; pl_free_fb 輪轉到下一個閒置 fb
+//
+// 上層契約: blit_pipeline(buf) 回 tid, blit_pipeline_wait() 或 wait(tid) 等翻頁完成。
+// 撕裂: 永遠只寫不在(顯示中/pending)的 fb → 零撕裂; 翻頁在 VSYNC 原子切換。
+static mp_obj_t dsi_blit_pipeline(mp_obj_t self_in, mp_obj_t buf_in) {
+    mp_lcd_dsi_bus_obj_t *self = (mp_lcd_dsi_bus_obj_t *)self_in;
+    if (self->dpi_panel == NULL)
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("bus deinitialized"));
+    if (self->num_fbs < 3 || self->fbs[2] == NULL)
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("blit_pipeline needs fb_count>=3"));
+
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(buf_in, &bufinfo, MP_BUFFER_READ);
+    size_t copy_bytes = bufinfo.len < self->fb_size ? bufinfo.len : self->fb_size;
+
+    // ── 1. 等上一個 pending 翻頁完成 (IDF 單 flip 限制) ──
+    //    on_refresh_done 會清 pl_pending_*; 用 1ms 輪詢 (與 wait() 同粒度)。
+    //    極端情況(首幀 / 剛 drain) pl_pending_fb 已是 -1 → 零等待直入。
+    mp_uint_t deadline = mp_hal_ticks_ms() + 10000;   // 10s 保守逾時
+    while (self->pl_pending_fb != -1) {
+        if (mp_hal_ticks_ms() > deadline)
+            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("blit_pipeline: pending flip timeout"));
+        mp_hal_delay_ms(1);
+    }
+
+    // ── 2. 取閒置 fb (≠ cur_fb 顯示中, ≠ pl_pending_fb 待翻) ──
+    int dst = -1;
+    for (int i = 0; i < self->num_fbs; i++) {
+        if (i != self->cur_fb && i != self->pl_pending_fb) {   // pl_pending_fb 此時必為 -1
+            dst = i;
+            break;
+        }
+    }
+    if (dst < 0)
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("blit_pipeline: no free fb"));
+
+    // ── 3. CPU memcpy 整幀到閒置 fb (與 DMA 掃 cur_fb 並行, 不阻塞顯示) ──
+    memcpy(self->fbs[dst], bufinfo.buf, copy_bytes);
+    // 不需自己做 esp_cache_msync — 下一步 draw_bitmap 的 no-copy 路徑會做全幀 C2M。
+
+    // ── 4. 提交 page-flip (IDF 同步 msync + 設 cur_fb_index) ──
+    if (self->queue_count >= self->queue_depth)
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
+
+    int idx = self->queue_tail;
+    self->ref_bufs[idx] = MP_OBJ_FROM_PTR(self);
+    self->done_flags[idx] = false;
+    self->slot_kind[idx] = 1;          // 等 DMA EOF (on_refresh_done)
+    self->pending_segments[idx] = 0;
+    self->cur_fb = dst;                // 離屏現在是顯示目標 (IDF 會同步設 cur_fb_index)
+    self->queue_tail = (self->queue_tail + 1) % self->queue_depth;
+    self->queue_count++;
+
+    esp_err_t ret = esp_lcd_panel_draw_bitmap(
+        self->dpi_panel, 0, 0, self->panel_w, self->panel_h, self->fbs[dst]);
+    if (ret != ESP_OK) {
+        // 失敗: 釋放槽位, 別卡住 queue
+        self->ref_bufs[idx] = mp_const_none;
+        self->done_flags[idx] = true;
+        self->slot_kind[idx] = 0;
+        self->queue_head = (self->queue_head + 1) % self->queue_depth;
+        self->queue_count--;
+        mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("blit_pipeline (draw_bitmap) failed err=0x%x"), ret);
+    }
+
+    // ── 5. 更新管線狀態: 本幀變 pending, 輪轉 pl_free_fb ──
+    self->pl_pending_fb = dst;
+    self->pl_pending_tid = idx;
+    // pl_free_fb 留給下次開頭重算 (step 2 的迴圈會找); 這裡不預存避免過期。
+
+    return mp_obj_new_int(idx + 1);    // tid — 同 present() 契約, wait(tid) 等翻頁完成
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(dsi_blit_pipeline_obj, dsi_blit_pipeline);
+
+
 static mp_obj_t dsi_deinit(mp_obj_t self_in) {
     mp_lcd_dsi_bus_obj_t *self = (mp_lcd_dsi_bus_obj_t *)self_in;
     if (s_last_dsi == self) s_last_dsi = NULL;
@@ -865,6 +964,10 @@ static mp_obj_t dsi_deinit(mp_obj_t self_in) {
         self->slot_kind[i] = 0;
     }
     self->queue_count = 0;
+    // 重置 3-fb 管線狀態 (避免 deinit 後殘留 pending 阻擋)
+    self->pl_free_fb = 1;
+    self->pl_pending_fb = -1;
+    self->pl_pending_tid = -1;
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(dsi_deinit_obj, dsi_deinit);
@@ -882,6 +985,7 @@ static const mp_rom_map_elem_t dsi_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_frame_buffer), MP_ROM_PTR(&dsi_frame_buffer_obj) },
     { MP_ROM_QSTR(MP_QSTR_back_buffer),  MP_ROM_PTR(&dsi_back_buffer_obj) },
     { MP_ROM_QSTR(MP_QSTR_present),      MP_ROM_PTR(&dsi_present_obj) },
+    { MP_ROM_QSTR(MP_QSTR_blit_pipeline), MP_ROM_PTR(&dsi_blit_pipeline_obj) },
     { MP_ROM_QSTR(MP_QSTR_flush),        MP_ROM_PTR(&dsi_flush_obj) },
     { MP_ROM_QSTR(MP_QSTR_set_pattern),  MP_ROM_PTR(&dsi_set_pattern_obj) },
     { MP_ROM_QSTR(MP_QSTR_deinit),       MP_ROM_PTR(&dsi_deinit_obj) },
