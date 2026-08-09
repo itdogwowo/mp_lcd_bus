@@ -922,29 +922,35 @@ static mp_obj_t dsi_blit_pipeline(mp_obj_t self_in, mp_obj_t buf_in) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("queue full"));
 
     int idx = self->queue_tail;
+    // ⚠ 順序關鍵 (ISR 併發): DMA EOF 的 on_refresh_done 可在任意指令間觸發,
+    // 它用「ref_bufs!=none && !done_flags && slot_kind==1」找 present 槽。
+    // 必須先把 pl_pending_tid 設成本次 idx, 再把 slot 標成可被找到 (slot_kind=1),
+    // 否則 ISR 在兩者之間觸發時 pl_pending_tid 還是舊值 → 清了 slot 卻沒清
+    // pl_pending_fb → 下一幀 step 1 永遠等不到 pl_pending_fb==-1 → 超時卡死。
     self->ref_bufs[idx] = MP_OBJ_FROM_PTR(self);
     self->done_flags[idx] = false;
-    self->slot_kind[idx] = 1;          // 等 DMA EOF (on_refresh_done)
     self->pending_segments[idx] = 0;
     self->cur_fb = dst;                // 離屏現在是顯示目標 (IDF 會同步設 cur_fb_index)
+    self->pl_pending_fb = dst;         // 先設 pending (對應本次 idx), 再標 slot
+    self->pl_pending_tid = idx;
+    self->slot_kind[idx] = 1;          // ← 之後 ISR 才會認得這個 slot 為 present 槽
     self->queue_tail = (self->queue_tail + 1) % self->queue_depth;
     self->queue_count++;
 
     esp_err_t ret = esp_lcd_panel_draw_bitmap(
-        self->dpi_panel, 0, 0, self->panel_w, self->panel_h, self->fbs[dst]);
+        self->dpi_panel, 0, 0, self.panel_w, self->panel_h, self->fbs[dst]);
     if (ret != ESP_OK) {
-        // 失敗: 釋放槽位, 別卡住 queue
+        // 失敗: 釋放槽位 + 回滾管線狀態, 別卡住 queue
         self->ref_bufs[idx] = mp_const_none;
         self->done_flags[idx] = true;
         self->slot_kind[idx] = 0;
         self->queue_head = (self->queue_head + 1) % self->queue_depth;
         self->queue_count--;
+        self->pl_pending_fb = -1;
+        self->pl_pending_tid = -1;
         mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("blit_pipeline (draw_bitmap) failed err=0x%x"), ret);
     }
 
-    // ── 5. 更新管線狀態: 本幀變 pending, 輪轉 pl_free_fb ──
-    self->pl_pending_fb = dst;
-    self->pl_pending_tid = idx;
     // pl_free_fb 留給下次開頭重算 (step 2 的迴圈會找); 這裡不預存避免過期。
 
     return mp_obj_new_int(idx + 1);    // tid — 同 present() 契約, wait(tid) 等翻頁完成

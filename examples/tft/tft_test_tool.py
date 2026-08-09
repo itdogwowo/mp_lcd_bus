@@ -637,10 +637,27 @@ class TftTest:
         total = self.w * self.h * 2
         full_w, full_b = _make_test_frames(total)
         bus = self.tft._bus
+        raw = bus._bus                       # 原始 C DSIBus (診斷用)
+        dbg = hasattr(raw, "_pl_state")
+        if dbg:
+            print("    [dbg] pre-loop _pl_state={}".format(raw._pl_state()))
         t0 = time.ticks_us()
         for n in range(frames):
-            tid = bus.blit_pipeline(full_w if n & 1 else full_b)
+            if dbg:
+                print("    [dbg] #{} pre-submit state={}".format(n, raw._pl_state()))
+            try:
+                tid = bus.blit_pipeline(full_w if n & 1 else full_b)
+            except RuntimeError as e:
+                print("    [dbg] #{} blit_pipeline RAISE: {} state={}".format(
+                    n, e, raw._pl_state()))
+                return
+            if dbg:
+                print("    [dbg] #{} post-submit tid={} state={}".format(n, tid, raw._pl_state()))
             bus.blit_pipeline_wait(tid)
+            if dbg:
+                print("    [dbg] #{} post-wait state={}".format(n, raw._pl_state()))
+            if n >= 2 and dbg:
+                dbg = False                  # 印前 3 幀就好, 別洗版
         elapsed = time.ticks_diff(time.ticks_us(), t0) / 1_000_000
         fps = frames / elapsed
         mbps = total * frames / elapsed / (1024 * 1024)
