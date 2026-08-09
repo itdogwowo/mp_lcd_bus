@@ -228,7 +228,49 @@ updates with multiple fbs will flip between stale contents every frame.
 
 For reference, `test_dsi.py` covers all three paths: direct writes + `flush()`
 (colors/gradient), async `write()` with external buffers, and the tear-free
-double-buffer swap demo.
+double-buffer swap demo. The fuller harness in `examples/tft/tft_test_tool.py`
+also exposes per-path FPS breakdowns (see below).
+
+### Performance & per-path breakdown (ESP32-P4, 1024×600 RGB565)
+
+`fb_count=3` is the recommended config — it leaves one fb free for the CPU to
+write while the DPI DMA scans another, and `back_buffer()` returns that free fb
+as a zero-copy view. The middle layer (`show_atomic` / `write_frame` /
+`write_frame_dma`) draws into `back_buffer()` with a CPU memcpy, then calls
+`present()` to page-flip at the next frame boundary.
+
+The harness prints a per-path breakdown (`dsi_writepath_breakdown`) that
+isolates each stage. Representative numbers on a JC1060P470 (1024×600, 2-lane
+DSI @ 550 Mbps, 58 MHz DPI clock → 65 Hz refresh, 200 MHz PSRAM):
+
+| Path | ms / frame | MB/s | FPS | Notes |
+|---|---|---|---|---|
+| `write()` PPA (DMA2D) → fb | 25.8 | 45 | — | Hardware 2D blit; slower than CPU memcpy for full frames |
+| `back_buffer()[:]=buf` (CPU memcpy) | 14.5 | 81 | — | Raw CPU memcpy into the off-screen fb |
+| `present()` only (no draw) | 15.4 | — | 65 | Panel refresh ceiling (VSYNC period) |
+| `back_buffer` copy + `present` + `wait` | 22.6 | 52 | 44 | End-to-end tear-free full-frame update |
+| `show_atomic` / `blit` (middle layer) | 23.3 | 50 | **~43** | App-facing full-frame path (animations, full-screen blits) |
+
+**Read this table as:** the middle layer reaches ~43 FPS (up from 32 FPS with
+the PPA path) because CPU memcpy (~81 MB/s) beats the PPA DMA2D blit (~45 MB/s)
+for full-frame copies, and the page-flip is a no-copy VSYNC swap. The 65 FPS
+panel ceiling is set by the DPI refresh, not the CPU.
+
+> **Phase-locking caveat:** `present()` waits for the next frame boundary, so
+> the end-to-end time can lock to *either* ~22 ms (good phase, ~44 FPS) or
+> ~31 ms (bad phase, ~32 FPS) depending on when the copy finishes relative to
+> VSYNC. This is inherent to the IDF DPI driver's single-pending-flip model, not
+> a bug — the same code alternates between the two across runs. Reaching a
+> stable 60 FPS would require true 3-fb overlap (start the next copy while the
+> previous frame is still scanning out), which the optional `blit_pipeline()`
+> C method scaffolds but does not yet fully pipeline.
+
+Run the breakdown yourself (from `examples/tft/`, so `lib/` resolves):
+
+```python
+import tft_test_tool
+tft_test_tool.run("dsi_jd9165_1024x600")   # prints FPS per path + breakdown
+```
 
 ---
 

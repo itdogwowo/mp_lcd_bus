@@ -317,8 +317,11 @@ def _alloc_psram_frame(size):
     """整幀 buffer 放 PSRAM — DSI write() 對 PSRAM src 零拷貝直進 PPA 硬體 blit。
     DRAM bytearray 會被 C 層先 CPU memcpy 到 PSRAM bounce, 拖慢 write()。
     自動路由: PSRAM 滿 → gc.collect() 重試 (heap_caps buffer 靠 GC 回收)
-    → 仍失敗才掉 DRAM bytearray (C 層會自動 bounce, 只慢不壞)。"""
-    for _attempt in range(2):
+    → 仍失敗才掉 DRAM bytearray (C 層會自動 bounce, 只慢不壞)。
+    fb_count=3 用掉 3.6MB → 碎片化時可能連 1.2MB 連續區都配不到,
+    故多試幾輪 gc + DRAM fallback 也包 try (避免崩)。"""
+    # 先試 PSRAM (最多 3 輪, 每輪 gc.collect 釋放舊測試 buffer)
+    for _attempt in range(3):
         try:
             import heap_caps
             b = heap_caps.malloc(size, heap_caps.CAP_SPIRAM)
@@ -329,7 +332,20 @@ def _alloc_psram_frame(size):
         except MemoryError:
             pass
         gc.collect()
-    return bytearray(size)
+    # PSRAM 連續區不足 → 退 DRAM (也可能因碎片失敗, 包 try 避免 shapes 崩)
+    try:
+        return bytearray(size)
+    except MemoryError:
+        # 連 DRAM 都沒有 → 最後一搏: 強制 GC + 再試一次 PSRAM
+        gc.collect()
+        try:
+            import heap_caps
+            b = heap_caps.malloc(size, heap_caps.CAP_SPIRAM)
+            if b is not None:
+                return b
+        except Exception:
+            pass
+        raise MemoryError("無法配置 {} bytes (PSRAM+DRAM 都碎片化)".format(size))
 
 
 def _make_test_frames(total):
@@ -623,10 +639,11 @@ class TftTest:
             fps, elapsed / frames * 1000, mbps))
 
     def fps_test_pipeline(self, frames=50):
-        """3-fb 管線 FPS — DSI fb_count>=3 專用。
+        """3-fb 管線 FPS — DSI fb_count>=3 專用 (走 C blit_pipeline)。
 
-        CPU memcpy 直寫閒置 fb + 3 緩衝輪轉,讓「拷貝」與「DMA 掃上一幀」重疊。
-        對照 FPS(blit) (PPA 序列路徑) 驗證管線化效益。目標逼近面板上限 (~65 FPS)。"""
+        對照 FPS(blit) (中間層 back_buffer 序列路徑)。注意:目前 blit_pipeline
+        的 step-1 等 EOF 未真正重疊 (~40 FPS), 序列 back_buffer 路徑反而較快 (~44)。
+        保留此測試作為 3-fb 重疊優化的基準線。"""
         if self.bus_type != "dsi":
             print("FPS(pipeline): 僅 DSI 適用, 略過")
             return
@@ -637,32 +654,41 @@ class TftTest:
         total = self.w * self.h * 2
         full_w, full_b = _make_test_frames(total)
         bus = self.tft._bus
-        raw = bus._bus                       # 原始 C DSIBus (診斷用)
-        dbg = hasattr(raw, "_pl_state")
-        if dbg:
-            print("    [dbg] pre-loop _pl_state={}".format(raw._pl_state()))
         t0 = time.ticks_us()
         for n in range(frames):
-            if dbg:
-                print("    [dbg] #{} pre-submit state={}".format(n, raw._pl_state()))
-            try:
-                tid = bus.blit_pipeline(full_w if n & 1 else full_b)
-            except RuntimeError as e:
-                print("    [dbg] #{} blit_pipeline RAISE: {} state={}".format(
-                    n, e, raw._pl_state()))
-                return
-            if dbg:
-                print("    [dbg] #{} post-submit tid={} state={}".format(n, tid, raw._pl_state()))
+            tid = bus.blit_pipeline(full_w if n & 1 else full_b)
             bus.blit_pipeline_wait(tid)
-            if dbg:
-                print("    [dbg] #{} post-wait state={}".format(n, raw._pl_state()))
-            if n >= 2 and dbg:
-                dbg = False                  # 印前 3 幀就好, 別洗版
         elapsed = time.ticks_diff(time.ticks_us(), t0) / 1_000_000
         fps = frames / elapsed
         mbps = total * frames / elapsed / (1024 * 1024)
         print("FPS(pipeline): {:.0f}  ({:.1f} ms/frame, {:.1f} MB/s)".format(
             fps, elapsed / frames * 1000, mbps))
+
+    def diag_backbuf_timing(self, frames=20):
+        """診斷:量 _backbuf_present 每幀總時間, 觀察 VSYNC 相位鎖定現象。
+        預期:多數幀 ~22ms (43 FPS), 少數被 wait 相位卡到 ~31ms (32 FPS)。
+        用法: tft_test.diag_backbuf_timing() (不接進 run_all, 按需呼叫)"""
+        if self.bus_type != "dsi":
+            print("  diag: 僅 DSI")
+            return
+        import time as _t
+        gc.collect()
+        total = self.w * self.h * 2
+        full_w, full_b = _make_test_frames(total)
+        bus = self.tft._bus
+        print("  [diag] _backbuf_present × {} (觀察相位鎖定):".format(frames))
+        fast = slow = 0
+        for n in range(frames):
+            t0 = _t.ticks_us()
+            bus._backbuf_present(full_w if n & 1 else full_b)
+            dt = _t.ticks_diff(_t.ticks_us(), t0) / 1000
+            tag = "fast" if dt < 25 else "SLOW"
+            if dt < 25: fast += 1
+            else: slow += 1
+            print("    #{:2d} {:5.1f}ms {}".format(n, dt, tag))
+        print("  [diag] fast(<25ms)={} slow(>=25ms)={} → 相位鎖定 {}勢".format(
+            fast, slow, "劣" if slow > fast else "優"))
+
 
     def fps_breakdown(self, frames=30):
         """DSI 分段計時 — 定位 write() 與等幀邊界各佔多少。

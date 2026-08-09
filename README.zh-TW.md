@@ -215,7 +215,45 @@ while True:
 舊內容之間翻動。
 
 `test_dsi.py` 涵蓋全部三種路徑：直寫 + `flush()`（純色/漸層）、
-外部 buffer 的異步 `write()`、以及雙緩衝不撕裂示範。
+外部 buffer 的異步 `write()`、以及雙緩衝不撕裂示範。`examples/tft/tft_test_tool.py`
+另有更完整的測試 harness,含每條路徑的 FPS 分段計時（見下方）。
+
+### 效能與分段跑分（ESP32-P4，1024×600 RGB565）
+
+建議用 `fb_count=3` —— DPI DMA 掃描某塊 fb 時,CPU 可同時寫另一塊閒置 fb,
+`back_buffer()` 即回傳該閒置 fb 的零拷貝 view。中間層（`show_atomic` /
+`write_frame` / `write_frame_dma`）用 CPU memcpy 把整幀畫進 `back_buffer()`,
+再呼叫 `present()` 在下一個幀邊界翻頁。
+
+harness 會印出分段跑分（`dsi_writepath_breakdown`）,把每個階段獨立計時。
+JC1060P470（1024×600、2-lane DSI @ 550 Mbps、58 MHz DPI clock → 65 Hz 刷新、
+200 MHz PSRAM）上的代表性數字:
+
+| 路徑 | ms / 幀 | MB/s | FPS | 說明 |
+|---|---|---|---|---|
+| `write()` PPA（DMA2D）→ fb | 25.8 | 45 | — | 硬體 2D blit;整幀拷貝比 CPU memcpy 慢 |
+| `back_buffer()[:]=buf`（CPU memcpy） | 14.5 | 81 | — | 純 CPU memcpy 寫進離屏 fb |
+| 只 `present()`（不繪圖） | 15.4 | — | 65 | 面板刷新上限（VSYNC 週期） |
+| back_buffer 拷貝 + `present` + `wait` | 22.6 | 52 | 44 | 端到端、零撕裂整幀更新 |
+| `show_atomic` / `blit`（中間層） | 23.3 | 50 | **~43** | 應用面向的整幀路徑（動畫、整頁 blit） |
+
+**怎麼讀這張表:** 中間層達到 ~43 FPS（PPA 路徑是 32 FPS）,因為 CPU memcpy
+（~81 MB/s）對整幀拷貝比 PPA DMA2D blit（~45 MB/s）快,加上 page-flip 是
+VSYNC 邊界的零拷貝切換。65 FPS 的面板上限由 DPI 刷新決定,不是 CPU。
+
+> **相位鎖定提醒:** `present()` 要等下一個幀邊界,所以端到端時間會鎖在
+> ~22 ms（好相位,~44 FPS）或 ~31 ms（壞相位,~32 FPS）,取決於拷貝完成時
+> 相對於 VSYNC 的時機。這是 IDF DPI driver「同一時間只允許一個 pending flip」
+> 的固有特性,不是 bug —— 同一份程式碼每次跑會在兩者之間跳。要穩定達到
+> 60 FPS 需要真正的 3-fb 重疊（上一幀還在掃描時就開始拷貝下一幀）,可選的
+> `blit_pipeline()` C 方法已搭好骨架但尚未完全管線化。
+
+自己跑分段跑分（從 `examples/tft/` 執行,才能找到 `lib/`）:
+
+```python
+import tft_test_tool
+tft_test_tool.run("dsi_jd9165_1024x600")   # 印出每條路徑 FPS + 分段計時
+```
 
 ---
 
