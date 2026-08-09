@@ -952,6 +952,22 @@ static mp_obj_t dsi_blit_pipeline(mp_obj_t self_in, mp_obj_t buf_in) {
 static MP_DEFINE_CONST_FUN_OBJ_2(dsi_blit_pipeline_obj, dsi_blit_pipeline);
 
 
+// _pl_state() — 診斷用:回傳 (pl_free_fb, pl_pending_fb, pl_pending_tid, cur_fb, queue_count)
+// 讓 Python 端能觀察 3-fb 管線內部狀態, 定位卡住原因。
+static mp_obj_t dsi_pl_state(mp_obj_t self_in) {
+    mp_lcd_dsi_bus_obj_t *self = (mp_lcd_dsi_bus_obj_t *)self_in;
+    mp_obj_t t[5] = {
+        mp_obj_new_int(self->pl_free_fb),
+        mp_obj_new_int(self->pl_pending_fb),
+        mp_obj_new_int(self->pl_pending_tid),
+        mp_obj_new_int(self->cur_fb),
+        mp_obj_new_int(self->queue_count),
+    };
+    return mp_obj_new_tuple(5, t);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(dsi_pl_state_obj, dsi_pl_state);
+
+
 static mp_obj_t dsi_deinit(mp_obj_t self_in) {
     mp_lcd_dsi_bus_obj_t *self = (mp_lcd_dsi_bus_obj_t *)self_in;
     if (s_last_dsi == self) s_last_dsi = NULL;
@@ -986,6 +1002,7 @@ static const mp_rom_map_elem_t dsi_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_back_buffer),  MP_ROM_PTR(&dsi_back_buffer_obj) },
     { MP_ROM_QSTR(MP_QSTR_present),      MP_ROM_PTR(&dsi_present_obj) },
     { MP_ROM_QSTR(MP_QSTR_blit_pipeline), MP_ROM_PTR(&dsi_blit_pipeline_obj) },
+    { MP_ROM_QSTR(MP_QSTR__pl_state),     MP_ROM_PTR(&dsi_pl_state_obj) },
     { MP_ROM_QSTR(MP_QSTR_flush),        MP_ROM_PTR(&dsi_flush_obj) },
     { MP_ROM_QSTR(MP_QSTR_set_pattern),  MP_ROM_PTR(&dsi_set_pattern_obj) },
     { MP_ROM_QSTR(MP_QSTR_deinit),       MP_ROM_PTR(&dsi_deinit_obj) },
