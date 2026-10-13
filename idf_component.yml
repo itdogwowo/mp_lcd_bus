@@ -1,0 +1,16 @@
+## IDF Component Manager Manifest File
+#
+# This is the module's request file: everything mp_lcd_bus needs from the IDF
+# side is declared here.
+#
+# No registry dependencies.
+#
+# mp_make_tools_idf_components lists *built-in* IDF components that must be part
+# of the build. They cannot go under `dependencies:` (that block is for
+# registry/git components), so the build tool adds them to IDF_COMPONENTS in
+# ports/esp32/esp32_common.cmake. esp_lcd is needed because IDF 5 pulled it in
+# implicitly through the legacy `driver` meta-component, while IDF v6 turned
+# that meta-component into an empty shim -- without this, IDF fails with
+# "BUG: component_requirements.py: cannot find original component for source
+# component esp_lcd".
+mp_make_tools_idf_components: ["esp_lcd"]
